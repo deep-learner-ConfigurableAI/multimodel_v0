@@ -15,3 +15,5 @@ annotations_trainval2017.zip
 .python-version
 *.zip
 train2017
+Falcon*
+Qwen*
