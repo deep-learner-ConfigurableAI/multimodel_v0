@@ -74,6 +74,7 @@ class ResnetGPT2Wrapper(nn.Module):
 
 
 
+
         B, T, D = tok_embeds.shape
         N = img_features.shape[1]
 
@@ -99,9 +100,10 @@ class ResnetGPT2Wrapper(nn.Module):
         # print("k dtype:", k.dtype)
         # print("v dtype:", v.dtype)
 
-    
 
         enriched = self.perform_mha_on_cpu(queries, k, v)
+
+        
 
         enriched = self.layernorm(queries + enriched) 
 
