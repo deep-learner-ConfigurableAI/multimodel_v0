@@ -3,6 +3,8 @@ import torch
 
 ### Decoder Block ####
 
+device = torch.device("mps")
+
 class ResnetGPT2Wrapper(nn.Module):
     def __init__(self, gpt_decoder, embed_size, vocab_size, pad_token_id, num_heads=4, num_img_tokens=32):
         super().__init__()
@@ -68,15 +70,18 @@ class ResnetGPT2Wrapper(nn.Module):
         # print (f"img_features device", img_features.device)
         # print (f"tok_embeds", tok_embeds.device)
         # print (f"queries device {queries.device}")
-        
+
 
 
 
         B, T, D = tok_embeds.shape
         N = img_features.shape[1]
 
-        k = self.key_proj(img_features)              # (B, N, D)
-        v = self.value_proj(img_features)            # (B, N, D)
+        # self.key_proj = self.key_proj.to("cpu")
+        # img_features = img_features.to("cpu")
+
+        k = self.key_proj(img_features)  # (B, N, D)
+        v = self.value_proj(img_features)  # (B, N, D)
 
         k = k.to(tok_embeds.device)
         v = v.to(tok_embeds.device)
@@ -93,6 +98,8 @@ class ResnetGPT2Wrapper(nn.Module):
         # print("queries dtype:", queries.dtype)
         # print("k dtype:", k.dtype)
         # print("v dtype:", v.dtype)
+
+    
 
         enriched = self.perform_mha_on_cpu(queries, k, v)
 
@@ -130,12 +137,17 @@ class ResnetGPT2Wrapper(nn.Module):
             labels = torch.cat([pad_for_img, labels], dim=1)   # (B, M + T - 1)
 
 
-
-        outputs = self.gpt_decoder(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            labels=labels
-        )
+        if mode == "train":
+            outputs = self.gpt_decoder(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+        else:  # inference
+            outputs = self.gpt_decoder(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask
+            )
 
 
         # outputs = self.gpt_decoder(

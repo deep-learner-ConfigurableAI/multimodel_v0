@@ -1,4 +1,8 @@
 import torch 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 def freeze_model_layers(image_encoder, gpt_decoder, freeze_ratio=0.7):
 
@@ -166,6 +170,11 @@ def setup_data(N, val_split=0.2):
 
 
 def load_from_checkpoint():
+
+    from decoder_model import ResnetGPT2Wrapper 
+    from transformers import GPTNeoForCausalLM, AutoTokenizer
+    from encoder import CLIPEncoder
+
     CHECKPOINT_PATH = "checkpoint.pth"
 
     checkpoint = torch.load(CHECKPOINT_PATH)
@@ -174,15 +183,25 @@ def load_from_checkpoint():
    
     epoch = checkpoint['epoch']
     loss = checkpoint['loss']
+    global_step = checkpoint["global_step"]
 
 
     #### GPT DECODER  ######
     decoder_model_name = "GPT-NEO-350M"
-    from transformers import GPTNeoForCausalLM, AutoTokenizer
 
 
     gpt_decoder = GPTNeoForCausalLM.from_pretrained(decoder_model_name)
+    tokenizer = AutoTokenizer.from_pretrained(decoder_model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+
+    special_tokens = {"additional_special_tokens": ["<START>", "<END>"]}
+    tokenizer.add_special_tokens(special_tokens)
+    gpt_decoder = GPTNeoForCausalLM.from_pretrained(decoder_model_name)
     gpt_decoder.config.pad_token_id = gpt_decoder.config.eos_token_id
+    gpt_decoder.resize_token_embeddings(gpt_decoder.get_input_embeddings().num_embeddings + 2) 
+
     gpt_decoder.load_state_dict(checkpoint['gpt_decoder_state_dict'])
 
 
@@ -192,20 +211,20 @@ def load_from_checkpoint():
     encoder.load_state_dict(checkpoint['encoder_state_dict'])
 
 
+    pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
 
     # Recreate decoder with same config
     decoder = ResnetGPT2Wrapper(
     gpt_decoder=gpt_decoder,
     embed_size=checkpoint['config']['embed_size'],
     vocab_size=checkpoint['config']['vocab_size'],
-    num_img_tokens=checkpoint['config']['num_img_tokens']
+    num_img_tokens=checkpoint['config']['num_img_tokens'],
+    pad_token_id=pad_token_id
            )
     
     decoder.load_state_dict(checkpoint['decoder_state_dict'])
 
-
-    encoder = encoder.to(device)
-    decoder = decoder.to(device)
-
-    return encoder, decoder 
+    encoder = encoder.to(device).to(torch.bfloat16)
+    decoder = decoder.to(device).to(torch.bfloat16)
+    return encoder, decoder , epoch, loss , global_step, tokenizer
 

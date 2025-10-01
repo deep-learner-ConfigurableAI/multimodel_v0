@@ -2,9 +2,10 @@ from transformers import CLIPModel
 import torch.nn as nn 
 import os 
 import torch 
+from dotenv import load_dotenv
 
-HF_TOKEN = "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"
-os.environ["HF_TOKEN"] = HF_TOKEN
+load_dotenv()
+
 
 
 class CLIPEncoder(nn.Module):
