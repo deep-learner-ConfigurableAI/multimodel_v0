@@ -1,11 +1,15 @@
-import torch
-import torch.nn as nn
 from transformers import CLIPModel
+import torch.nn as nn 
+import os 
+import torch 
+
+HF_TOKEN = "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"
+os.environ["HF_TOKEN"] = HF_TOKEN
+
 
 class CLIPEncoder(nn.Module):
-    def __init__(self, embed_size=768, model_name="openai/clip-vit-base-patch32", freeze_vision=True):
+    def __init__(self, embed_size, model_name="openai/clip-vit-base-patch32", freeze_vision=True):
         super().__init__()
-        # Load pretrained CLIP
         self.clip = CLIPModel.from_pretrained(model_name)
         self.vision = self.clip.vision_model  # Vision tower (ViT)
 
