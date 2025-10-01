@@ -17,3 +17,6 @@ annotations_trainval2017.zip
 train2017
 Falcon*
 Qwen*
+GPT-NEO*
+.idea*
+checkpoint*
