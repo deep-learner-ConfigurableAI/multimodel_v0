@@ -101,7 +101,7 @@ def calculate_total_train_params(image_encoder, caption_encoder):
     return all_params
 
 
-def save_to_checkpoint(encoder, decoder, optimizer, epoch, loss, global_step):
+def save_to_checkpoint(encoder, decoder, optimizer, epoch, loss, global_step, tmp_suffix=".tmp"):
     print (f" SAVING INTO CHECKPOINT at global step {global_step} and loss {loss}")
     CHECKPOINT_PATH = "checkpoint.pth"
     checkpoint = {
@@ -119,7 +119,13 @@ def save_to_checkpoint(encoder, decoder, optimizer, epoch, loss, global_step):
     }
 }
     
-    torch.save(checkpoint, CHECKPOINT_PATH)
+    tmp_path = CHECKPOINT_PATH + tmp_suffix
+    # 1. Save to temporary file
+    torch.save(checkpoint, tmp_path)
+    import os 
+    os.replace(tmp_path, CHECKPOINT_PATH)   
+
+    
 
 
 

@@ -40,11 +40,11 @@ def get_models():
         image_h: ClassVar[int] = 224
         image_w: ClassVar[int] = 224
         steps: ClassVar[int] = 0
-        epochs: ClassVar[int] = 1
-        lr: ClassVar[float] = 1e-5
+        epochs: ClassVar[int] = 10
+        lr: ClassVar[float] = 2e-5
         accumulation_steps: ClassVar[int] = 4
         vocab_size: ClassVar[int] = gpt_model.config.vocab_size
-        number_of_items : ClassVar[int] = 5000
+        number_of_items : ClassVar[int] = 80000
         caption_len : ClassVar[int] = 20 
 
     encoder_model = CLIPEncoder(TrainingConfig.embed_size)

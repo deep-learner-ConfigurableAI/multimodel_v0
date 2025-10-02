@@ -124,10 +124,26 @@ class ResnetGPT2Wrapper(nn.Module):
 
 
         if attention_mask is not None:
+            B, T = captions_tensor.size()
+            seq_len = inputs_embeds.size(1)   # M (img) + T (text)
+
+            # --- Step 1: Image mask (all ones, no padding for image tokens) ---
             img_mask = torch.ones(B, self.num_img_tokens, device=tok_embeds.device)
-            attention_mask = torch.cat([img_mask, attention_mask], dim=1)
-            attention_mask = attention_mask[:, :].contiguous()
-            attention_mask = attention_mask.to(tok_embeds.device)
+
+            # --- Step 2: Extend text mask with img mask ---
+            # attention_mask is (B, T) for text
+            attention_mask = torch.cat([img_mask, attention_mask], dim=1)  # (B, M+T)
+
+            # --- Step 3: Padding mask for broadcasting ---
+            # (B, 1, 1, seq_len)
+            padding_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+
+            # --- Step 4: Build causal mask ---
+            causal_mask = torch.tril(torch.ones((seq_len, seq_len), device=tok_embeds.device))
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # (1,1,seq_len,seq_len)
+
+            # --- Step 5: Combine causal + padding ---
+            attention_mask = causal_mask * padding_mask
             
             # attention_mask = attention_mask[:, None, None, :].to(dtype=inputs_embeds.dtype)  # (B, 1, 1, seq_len)
 
