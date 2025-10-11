@@ -34,4 +34,4 @@ class CLIPEncoder(nn.Module):
         feats = feats[:, 1:, :]  # (B, num_patches, D)
 
         feats = self.proj(feats)  # (B, num_patches, embed_size)
-        return feats.to(torch.bfloat16)
+        return feats

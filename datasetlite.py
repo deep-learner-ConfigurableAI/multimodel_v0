@@ -40,4 +40,4 @@ class DataLoaderLite(Dataset):
             truncation=True
         )
 
-        return image_tensor.to(torch.bfloat16), tokens["input_ids"].squeeze(0), tokens["attention_mask"].squeeze(0)
+        return image_tensor, tokens["input_ids"].squeeze(0), tokens["attention_mask"].squeeze(0)

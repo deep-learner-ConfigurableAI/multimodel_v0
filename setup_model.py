@@ -4,6 +4,11 @@ from utils import freeze_model_layers, calculate_total_train_params
 from typing import ClassVar
 
 from dotenv import load_dotenv
+import os 
+from utils import load_from_checkpoint 
+
+
+FLAG =1
 
 load_dotenv()
 
@@ -35,7 +40,7 @@ def get_models():
         gpt_hidden_size: ClassVar[int] = gpt_model.config.hidden_size
         embed_size: ClassVar[int] = gpt_hidden_size      # to match GPT hidden size
         hidden_size: ClassVar[int] = gpt_hidden_size
-        batch_size: ClassVar[int] = 4
+        batch_size: ClassVar[int] = 16
         input_channels: ClassVar[int] = 3
         image_h: ClassVar[int] = 224
         image_w: ClassVar[int] = 224
@@ -59,7 +64,25 @@ def get_models():
     decoder_model = decoder_model.to(device)
     encoder_model = encoder_model.to(device)
 
-    return TrainingConfig, encoder_model, decoder_model , pad_token_id, tokenizer
+    extras_dict = {}
+
+
+    if os.path.exists("checkpoint.pth") and FLAG:
+        encoder_model, decoder_model , epoch, loss , global_step, tokenizer = load_from_checkpoint()
+        print ("Loading from Checkpoint...!")
+        print (f"epoch {epoch}")
+        print (f"loss {loss}")
+        print (f"global_step {global_step}")
+        extras_dict["global_step"] = global_step
+        extras_dict["epoch"] = epoch
+        extras_dict["loss"] = loss 
+        encoder_model, gpt_model = freeze_model_layers(encoder_model, gpt_model)
+        return  TrainingConfig, encoder_model, decoder_model , pad_token_id, tokenizer, extras_dict
+    
+    else:
+        print ("Checkpoint is not Found !!!")
+
+    return TrainingConfig, encoder_model, decoder_model , pad_token_id, tokenizer, extras_dict
 
 
 
