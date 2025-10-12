@@ -22,6 +22,8 @@ def get_models():
 
     model_name_or_path = "GPT-NEO-350M"  
 
+    print ("\n\t Loading Model Classes and Tokenizer ..!")
+
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     gpt_model = GPTNeoForCausalLM.from_pretrained(model_name_or_path)
 
@@ -34,25 +36,31 @@ def get_models():
 
     gpt_model.resize_token_embeddings(gpt_model.get_input_embeddings().num_embeddings + 2)  
 
+    print ("\n\t Resizing Tokenizer ..!")
+
+
     gpt_model = gpt_model.to(device)
 
     class TrainingConfig(BaseModel):
         gpt_hidden_size: ClassVar[int] = gpt_model.config.hidden_size
         embed_size: ClassVar[int] = gpt_hidden_size      # to match GPT hidden size
         hidden_size: ClassVar[int] = gpt_hidden_size
-        batch_size: ClassVar[int] = 16
+        batch_size: ClassVar[int] = 8
         input_channels: ClassVar[int] = 3
         image_h: ClassVar[int] = 224
         image_w: ClassVar[int] = 224
         steps: ClassVar[int] = 0
         epochs: ClassVar[int] = 10
-        lr: ClassVar[float] = 2e-5
+        lr: ClassVar[float] = 2e-4
         accumulation_steps: ClassVar[int] = 4
         vocab_size: ClassVar[int] = gpt_model.config.vocab_size
         number_of_items : ClassVar[int] = 80000
         caption_len : ClassVar[int] = 20 
 
     encoder_model = CLIPEncoder(TrainingConfig.embed_size)
+
+    print ("\n\t Freezing CLIP & GPT Model ..!")
+
     encoder_model, gpt_model = freeze_model_layers(encoder_model, gpt_model)
     decoder_model = ResnetGPT2Wrapper(gpt_model, TrainingConfig.embed_size, TrainingConfig.vocab_size, pad_token_id)
 

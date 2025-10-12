@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def freeze_model_layers(image_encoder, gpt_decoder, freeze_ratio=0.7):
+def freeze_model_layers(image_encoder, gpt_decoder, freeze_ratio=0.4):
 
     # Freeze CLIP completely
     for param in image_encoder.parameters():
