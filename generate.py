@@ -9,8 +9,6 @@ from transformers.generation.logits_process import (
 import matplotlib.pyplot as plt
 
 
-    
-
 
 def visualize_caption(image_tensor, caption, gt_caption=None, figsize=(10, 8), similarity_data=None):
     import torch, matplotlib.pyplot as plt

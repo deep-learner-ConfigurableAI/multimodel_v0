@@ -123,9 +123,48 @@ This progressive unfreezing strategy allows the model to first learn cross-modal
 
 ## 📋 Usage
 
+### Using the Model from Hugging Face Hub
+
+The model is available on Hugging Face Hub and can be easily used in your projects:
+
+```python
+import torch
+from PIL import Image
+from torchvision import transforms
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
+
+# Download model files from Hugging Face Hub
+model_name = "verma75preetam/qvision-mutlimodel-base"
+config_path = hf_hub_download(repo_id=model_name, filename="config.json")
+encoder_path = hf_hub_download(repo_id=model_name, filename="encoder.safetensors")
+decoder_path = hf_hub_download(repo_id=model_name, filename="decoder.safetensors")
+gpt_decoder_path = hf_hub_download(repo_id=model_name, filename="gpt_decoder.safetensors")
+
+# Download helper scripts
+encoder_py_path = hf_hub_download(repo_id=model_name, filename="encoder.py")
+decoder_model_py_path = hf_hub_download(repo_id=model_name, filename="decoder_model.py")
+generate_py_path = hf_hub_download(repo_id=model_name, filename="generate.py")
+
+# Add scripts to path
+import sys, os
+sys.path.append(os.path.dirname(encoder_py_path))
+
+# Import model classes
+from encoder import CLIPEncoder
+from decoder_model import ResnetGPT2Wrapper
+from transformers import GPTNeoForCausalLM, AutoTokenizer
+from generate import generate_caption
+
+# Load model components
+# (See test_huggingface_model.py for complete implementation)
+```
+
+For a complete implementation, see the `test_huggingface_model.py` file in this repository.
+
 ### Running Inference with driver.py
 
-To generate captions for your own images:
+To generate captions for your own images using the local model:
 
 ```bash
 # Basic usage
@@ -256,7 +295,7 @@ multimodel/
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
-## 🙏 Acknowledgments
+##  Acknowledgments
 
 - CLIP by OpenAI for the vision encoder
 - GPT-Neo for the language decoder
