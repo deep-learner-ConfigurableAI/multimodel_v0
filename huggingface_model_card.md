@@ -1,3 +1,22 @@
+---
+language: en
+license: mit
+library_name: pytorch
+tags:
+- image-captioning
+- vision-language
+- multimodal
+- clip
+- gpt-neo
+- q-former
+- safetensors
+datasets:
+- coco
+metrics:
+- inference time
+pipeline_tag: image-to-text
+---
+
 # QVision MultiModel: Efficient Vision-Language Model with Q-Former Architecture
 
 QVision MultiModel is a lightweight and efficient vision-language model that combines the power of CLIP's visual encoder with a GPT-style decoder, bridging the gap between vision and language tasks. The model leverages a Q-Former architecture inspired by state-of-the-art multimodal systems to achieve high-quality image captioning capabilities while maintaining a small footprint.
