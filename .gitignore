@@ -21,3 +21,11 @@ GPT-NEO*
 .idea*
 checkpoint*
 .env
+hub
+model_safetensors/
+*.log
+*.csv
+*.h5
+*.ckpt
+*.pth
+*.bin
