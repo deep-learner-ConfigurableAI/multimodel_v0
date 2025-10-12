@@ -2,7 +2,7 @@
 
 MultiModel is a lightweight and efficient vision-language model that combines the power of CLIP's visual encoder with a GPT-style decoder, bridging the gap between vision and language tasks. The model leverages a Q-Former architecture inspired by state-of-the-art multimodal systems to achieve high-quality image captioning capabilities while maintaining a small footprint.
 
-## 🔍 Key Features
+##  Key Features
 
 - **Efficient Architecture**: Uses frozen CLIP vision encoder and GPT-Neo language model with trainable bridging layers
 - **Q-Former Design**: Employs learnable query tokens to extract relevant visual information
@@ -10,7 +10,7 @@ MultiModel is a lightweight and efficient vision-language model that combines th
 - **Low Latency**: Fast inference times suitable for real-time applications
 - **Easy to Use**: Simple API for image captioning and analysis
 
-## 🧪 Experimental Approach
+##  Experimental Approach
 
 Our approach focuses on efficient multimodal representation learning through a Q-Former architecture, which uses learnable query tokens to bridge the visual and textual domains. Key components of our experimental setup include:
 
@@ -48,7 +48,7 @@ Our model employs a sophisticated feature flow mechanism to bridge vision and la
 
 4. **Attention Visualization**: Analysis shows that query tokens learn to attend to semantically meaningful regions, with attention weights highlighting relevant objects for specific caption words
 
-## 📊 Model Performance
+##  Model Performance
 
 Our model achieves strong performance on image captioning tasks with significantly fewer parameters than comparable models:
 
@@ -103,7 +103,7 @@ Our training process followed a two-phase approach:
 
 This progressive unfreezing strategy allows the model to first learn cross-modal alignment with more constraints, then refine the language generation capabilities in the second phase.
 
-## 💡 Why This Approach Is Powerful
+##  Why This Approach Is Powerful
 
 1. **Efficiency**:
    - By freezing the pre-trained vision and language components, we drastically reduce the number of trainable parameters
@@ -234,7 +234,7 @@ cd multimodel
 pip install -r requirements.txt
 ```
 
-## 🗂️ Project Structure
+##  Project Structure
 
 ```
 multimodel/
