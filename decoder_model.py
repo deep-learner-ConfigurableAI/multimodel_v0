@@ -8,6 +8,143 @@ import numpy as np
 
 device = torch.device("mps")
 
+import torch
+from scipy.optimize import linear_sum_assignment
+
+from torch import nn
+
+def box_cxcywh_to_xyxy(x):
+    x_c, y_c, w, h = x.unbind(-1)
+    b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
+         (x_c + 0.5 * w), (y_c + 0.5 * h)]
+    return torch.stack(b, dim=-1)
+
+
+def box_area(boxes):
+    return (boxes[:, 2] - boxes[:, 0]).clamp(0) * (boxes[:, 3] - boxes[:, 1]).clamp(0)
+
+
+def generalized_box_iou(boxes1, boxes2):
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
+
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
+    
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+
+    union = area1[:, None] + area2 - inter
+    iou = inter / (union + 1e-7)
+
+    lt_enclose = torch.min(boxes1[:, None, :2], boxes2[:, :2])
+    rb_enclose = torch.max(boxes1[:, None, 2:], boxes2[:, 2:])
+    wh_enclose = (rb_enclose - lt_enclose).clamp(min=0)
+    area_enclose = wh_enclose[:, :, 0] * wh_enclose[:, :, 1]
+
+    giou = iou - (area_enclose - union) / (area_enclose + 1e-7)
+    return giou
+
+
+class HungarianMatcher(nn.Module):
+    def __init__(self, cost_class=1, cost_bbox=5, cost_giou=2):
+        super().__init__()
+        self.cost_class = cost_class
+        self.cost_bbox = cost_bbox
+        self.cost_giou = cost_giou
+        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "All costs can't be 0"
+
+    @torch.no_grad()
+    def forward(self, outputs, targets):
+        """
+        outputs: dict of tensors
+          - "bboxes": [B, num_queries, 4]
+          - "class_logits": [B, num_queries, num_classes]
+        targets: list of dicts
+          Each dict has:
+            - "labels": Tensor[num_gt]
+            - "boxes": Tensor[num_gt, 4]
+        """
+        bs, num_queries = outputs["class_logits"].shape[:2]
+        out_prob = outputs["class_logits"].softmax(-1)  # (B, num_queries, num_classes)
+        out_bbox = outputs["bboxes"]                   # (B, num_queries, 4)
+
+        indices = []
+        for b in range(bs):
+            tgt_ids = targets[b]["labels"]
+            tgt_bbox = targets[b]["boxes"]
+
+            # Compute classification cost
+            cost_class = -out_prob[b][:, tgt_ids]
+
+            # L1 cost between boxes
+            cost_bbox = torch.cdist(out_bbox[b], tgt_bbox, p=1)
+
+            # GIoU cost
+            cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox[b]), 
+                                             box_cxcywh_to_xyxy(tgt_bbox))
+
+            # Final cost matrix
+            C = (self.cost_class * cost_class
+               + self.cost_bbox * cost_bbox
+               + self.cost_giou * cost_giou)
+
+            C = C.cpu()
+            i, j = linear_sum_assignment(C)
+            indices.append((torch.as_tensor(i, dtype=torch.int64),
+                            torch.as_tensor(j, dtype=torch.int64)))
+
+        return indices
+    
+    
+class SetCriterion(nn.Module):
+    def __init__(self, num_classes, matcher, weight_dict):
+        super().__init__()
+        self.num_classes = num_classes
+        self.matcher = matcher
+        self.weight_dict = weight_dict
+        self.losses = ['labels', 'boxes', 'giou']
+
+    def loss_labels(self, outputs, targets, indices):
+        idx = self._get_src_permutation_idx(indices)
+        src_logits = outputs['class_logits'][idx]
+
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.full(src_logits.shape[:1], self.num_classes,
+                                    dtype=torch.int64, device=src_logits.device)
+
+        target_classes = target_classes.to(src_logits.device)
+        loss_ce = F.cross_entropy(src_logits, target_classes_o)
+        return {"loss_ce": loss_ce}
+
+    def loss_boxes(self, outputs, targets, indices):
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['bboxes'][idx]
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none').sum() / src_boxes.shape[0]
+        return {"loss_bbox": loss_bbox}
+
+    def loss_giou(self, outputs, targets, indices):
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = box_cxcywh_to_xyxy(outputs['bboxes'][idx])
+        target_boxes = box_cxcywh_to_xyxy(torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0))
+        loss_giou = 1 - torch.diag(generalized_box_iou(src_boxes, target_boxes)).mean()
+        return {"loss_giou": loss_giou}
+
+    def _get_src_permutation_idx(self, indices):
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.cat([src for (src, _) in indices])
+        return (batch_idx, src_idx)
+
+    def forward(self, outputs, targets):
+        indices = self.matcher(outputs, targets)
+        losses = {}
+        for loss in self.losses:
+            losses.update(getattr(self, f"loss_{loss}")(outputs, targets, indices))
+        return losses
+
+
+
 class ResnetGPT2Wrapper(nn.Module):
     def __init__(self, gpt_decoder, embed_size, vocab_size, pad_token_id, num_heads=8, num_img_tokens=64, debug_similarity=False):
         super().__init__()
@@ -85,6 +222,38 @@ class ResnetGPT2Wrapper(nn.Module):
         self.to("mps")
 
         self.cross_scale = nn.Parameter(torch.ones(1))
+
+
+        ####  localization head for bounding box prediction
+
+        self.num_classes = 80  #COCO classes 
+
+        
+
+
+        self.localization_head = nn.ModuleDict({
+            "bbox_head": nn.Sequential(
+                nn.Linear(embed_size, embed_size),
+                nn.ReLU(),
+                nn.Linear(embed_size, 4),  # [cx, cy, w, h] normalized (0–1)
+            ),
+            "objectness_head": nn.Sequential(
+                nn.Linear(embed_size, embed_size),
+                nn.ReLU(),
+                nn.Linear(embed_size, 1),  # sigmoid → probability
+            ),
+            "class_head": nn.Sequential(
+                nn.Linear(embed_size, embed_size),
+                nn.ReLU(),
+                nn.Linear(embed_size, self.num_classes)  # softmax over classes
+            )
+        })
+
+
+        self.matcher = HungarianMatcher(cost_class=1, cost_bbox=5, cost_giou=2)
+        self.criterion = SetCriterion(num_classes=80, matcher=self.matcher,
+                                weight_dict={'loss_ce': 1, 'loss_bbox': 5, 'loss_giou': 2})
+
 
 
         assert embed_size % num_heads == 0, "embed_size must be divisible by num_heads"
@@ -239,7 +408,7 @@ class ResnetGPT2Wrapper(nn.Module):
         else:
             plt.show()
 
-    def forward(self, img_features, captions_tensor, attention_mask=None, mode="train"):
+    def forward(self, img_features, captions_tensor, attention_mask=None, bbox_targets=None, class_targets=None, objectness_targets=None, mode="train"):
         """
         Q-Former style forward pass for image-text integration
         
@@ -443,17 +612,44 @@ class ResnetGPT2Wrapper(nn.Module):
         cross_out = cross_out + self.decoder_cross_attn_ffn(self.decoder_cross_attn_norm2(cross_out))
         cross_out = self.dropout(cross_out)
 
-        # ----- 6️⃣  Prediction head -----
+        # ----- 6️  Prediction head -----
         logits = self.gpt_decoder.lm_head(cross_out)
-        
-        # ----- 7️⃣  Loss -----
+        # Localization head predictions
+        bbox_preds = torch.sigmoid(self.localization_head["bbox_head"](img_token_features))  # (B, num_tokens, 4)
+        objectness_logits = self.localization_head["objectness_head"](img_token_features)    # (B, num_tokens, 1)
+        class_logits = self.localization_head["class_head"](img_token_features)              # (B, num_tokens, num_classes)
+
+        objectness_pred = torch.sigmoid(objectness_logits).squeeze(-1)  # (B, num_tokens)
+        class_pred = class_logits.argmax(dim=-1)  # (B, num_tokens)
+
+        # ----- 7  Loss -----
+
         loss = None
         if mode == "train":
             loss_fct = nn.CrossEntropyLoss(ignore_index=self.pad_token_id)
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = captions_tensor[:, 1:].contiguous()
-            loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
-            return logits, loss
+            lm_loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
+
+            # 2. Hungarian + SetCriterion for boxes + class
+            outputs_for_criterion = {
+                "bboxes": bbox_preds,
+                "class_logits": class_logits
+            }
+            targets_for_criterion = []
+            for b in range(B):
+                targets_for_criterion.append({
+                    "labels": class_targets[b],
+                    "boxes": bbox_targets[b]
+                })
+
+            criterion_losses = self.criterion(outputs_for_criterion, targets_for_criterion)
+            # Optional: Add objectness loss
+            objectness_loss = F.binary_cross_entropy_with_logits(objectness_logits, objectness_targets)
+
+            # Total loss
+            total_loss = lm_loss + criterion_losses["loss_bbox"] + criterion_losses["loss_giou"] + criterion_losses["loss_ce"] + 0.5 * objectness_loss
+            return logits, bbox_preds, objectness_pred, class_pred, total_loss
 
         else:  # ----- mode == "inference" -----
             # Mask padding tokens to avoid attention to them
@@ -461,7 +657,7 @@ class ResnetGPT2Wrapper(nn.Module):
                 attention_mask = (captions_tensor != self.pad_token_id).long()
 
             probs = F.softmax(logits, dim=-1)
-            return logits, None 
+            return logits, bbox_preds, objectness_pred, class_pred, None 
 
 
         # if attention_mask is not None:
