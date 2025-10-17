@@ -45,13 +45,13 @@ def get_models():
         gpt_hidden_size: ClassVar[int] = gpt_model.config.hidden_size
         embed_size: ClassVar[int] = gpt_hidden_size      # to match GPT hidden size
         hidden_size: ClassVar[int] = gpt_hidden_size
-        batch_size: ClassVar[int] = 8
+        batch_size: ClassVar[int] = 16
         input_channels: ClassVar[int] = 3
         image_h: ClassVar[int] = 224
         image_w: ClassVar[int] = 224
         steps: ClassVar[int] = 0
         epochs: ClassVar[int] = 10
-        lr: ClassVar[float] = 2e-4
+        lr: ClassVar[float] = 3e-4
         accumulation_steps: ClassVar[int] = 4
         vocab_size: ClassVar[int] = gpt_model.config.vocab_size
         number_of_items : ClassVar[int] = 80000

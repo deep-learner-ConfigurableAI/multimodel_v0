@@ -22,12 +22,11 @@ class DataLoaderLite(Dataset):
 
 
     def __len__(self):
-        return len(self.train_dataset_cocooptions)
+        return len(self.det_ds)
     
     def __getitem__(self, idx):
         img, image_captions = self.train_dataset_cocooptions[idx]
         img_d, det_target = self.det_ds[idx]
-
 
          # Apply CLIPProcessor
         image_tensor = clip_processor(images=img, return_tensors="pt")
@@ -36,16 +35,21 @@ class DataLoaderLite(Dataset):
         # prepend <START>, append <END>
         caption = "<START> " + image_captions[0] + " <END>"
 
-         # --- BBoxes and Class Labels ---
-        boxes = torch.tensor([ann['bbox'] for ann in det_target], dtype=torch.float32)
-        labels = torch.tensor([ann['category_id'] for ann in det_target], dtype=torch.int64)
+        # --- BBoxes and Class Labels ---
+        if len(det_target) == 0:
+            # No objects detected
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64) - 1  # -1 indicates no label
+        else:
+            boxes = torch.tensor([ann['bbox'] for ann in det_target], dtype=torch.float32)
+            labels = torch.tensor([ann['category_id'] for ann in det_target], dtype=torch.int64)
 
-        img_w, img_h = img_d.size
-        # Normalize [x, y, w, h]
-        boxes[:, 0] /= img_w
-        boxes[:, 1] /= img_h
-        boxes[:, 2] /= img_w
-        boxes[:, 3] /= img_h
+            # Normalize [x, y, w, h] to [0,1]
+            img_w, img_h = img_d.size
+            boxes[:, 0] /= img_w
+            boxes[:, 1] /= img_h
+            boxes[:, 2] /= img_w
+            boxes[:, 3] /= img_h
 
         # --- Objectness ---
         num_objects = boxes.shape[0]
