@@ -4,6 +4,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+device = torch.device("mps") 
+
+
 def freeze_model_layers(image_encoder, gpt_decoder, freeze_ratio=0.7):
 
     # Freeze CLIP completely
@@ -157,6 +160,14 @@ def setup_data(N, val_split=0.2):
         transform=transform
     )
 
+    coco_api = train_dataset_detection.coco
+    cat_ids = coco_api.getCatIds()
+
+    categories = coco_api.loadCats(cat_ids)
+
+    id_to_name = {cat["id"]: cat["name"] for cat in categories}
+    name_to_id = {cat["name"]: cat["id"] for cat in categories}
+
     train_dataset_cocooptions = Subset(train_dataset_cocooptions, range(N))
     train_dataset_detection = Subset(train_dataset_detection, range(N))
 
@@ -170,7 +181,7 @@ def setup_data(N, val_split=0.2):
     train_size = len(train_dataset_detection) - val_size
     train_dataset_detection, val_dataset_detection = random_split(train_dataset_detection, [train_size, val_size])
 
-    return train_dataset_cocooptions, val_dataset_cocooptions, train_dataset_detection , val_dataset_detection
+    return train_dataset_cocooptions, val_dataset_cocooptions, train_dataset_detection , val_dataset_detection, id_to_name, name_to_id 
 
 
 

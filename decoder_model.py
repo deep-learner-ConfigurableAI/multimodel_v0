@@ -208,6 +208,7 @@ class ResnetGPT2Wrapper(nn.Module):
 
         self.decoder_cross_attn = nn.MultiheadAttention(embed_dim=embed_size, num_heads=num_heads, batch_first=True, dropout=0.1)
         self.decoder_cross_attn_norm = nn.LayerNorm(embed_size)
+
         self.decoder_cross_attn_ffn = nn.Sequential(
             nn.Linear(embed_size, 4 * embed_size),
             nn.GELU(),
@@ -228,36 +229,59 @@ class ResnetGPT2Wrapper(nn.Module):
 
         self.num_classes = 80  #COCO classes 
 
-        
 
+        self.localization_ref_norm1 = nn.LayerNorm(embed_size, eps=1e-6)
+        self.localization_ref_attn = nn.MultiheadAttention(embed_size, 8, batch_first=True)
+        self.localization_ref_norm2 = nn.LayerNorm(embed_size, eps=1e-6)
+        self.localization_ref_ffn = nn.Sequential(
+            nn.Linear(embed_size, embed_size),
+            nn.GELU()
+        )
 
         self.localization_head = nn.ModuleDict({
+            "shared": nn.Sequential(
+                nn.Linear(embed_size, embed_size),
+                nn.LayerNorm(embed_size, eps=1e-6),
+                nn.GELU(),
+                nn.Dropout(0.1)
+            ),
+
+            # Bounding box prediction head (refined)
             "bbox_head": nn.Sequential(
-                nn.Linear(embed_size, embed_size),
-                nn.ReLU(),
-                nn.Linear(embed_size, 4),  # [cx, cy, w, h] normalized (0–1)
+                nn.Linear(embed_size, embed_size // 2),
+                nn.LayerNorm(embed_size // 2, eps=1e-6),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(embed_size // 2, embed_size // 4),
+                nn.GELU(),
+                nn.Linear(embed_size // 4, 4)
             ),
+
+            # Objectness (confidence) head
             "objectness_head": nn.Sequential(
-                nn.Linear(embed_size, embed_size),
-                nn.ReLU(),
-                nn.Linear(embed_size, 1),  # sigmoid → probability
+                nn.Linear(embed_size, embed_size // 2),
+                nn.LayerNorm(embed_size // 2, eps=1e-6),
+                nn.GELU(),
+                nn.Linear(embed_size // 2, 1)
             ),
+
+            # Classification head with residual refinement
             "class_head": nn.Sequential(
                 nn.Linear(embed_size, embed_size),
-                nn.ReLU(),
-                nn.Linear(embed_size, self.num_classes)  # softmax over classes
+                nn.LayerNorm(embed_size, eps=1e-6),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(embed_size, self.num_classes)
             )
         })
-
 
         self.matcher = HungarianMatcher(cost_class=1, cost_bbox=5, cost_giou=2)
         self.criterion = SetCriterion(num_classes=80, matcher=self.matcher,
                                 weight_dict={'loss_ce': 1, 'loss_bbox': 5, 'loss_giou': 2})
 
-
-
         assert embed_size % num_heads == 0, "embed_size must be divisible by num_heads"
 
+   
 
     def perform_mha_on_cpu(self, queries, k, v, attention_layer=None): 
         """
@@ -615,12 +639,30 @@ class ResnetGPT2Wrapper(nn.Module):
         # ----- 6️  Prediction head -----
         logits = self.gpt_decoder.lm_head(cross_out)
         # Localization head predictions
-        bbox_preds = torch.sigmoid(self.localization_head["bbox_head"](img_token_features))  # (B, num_tokens, 4)
-        objectness_logits = self.localization_head["objectness_head"](img_token_features)    # (B, num_tokens, 1)
-        class_logits = self.localization_head["class_head"](img_token_features)              # (B, num_tokens, num_classes)
+
+        # First pass through shared embedding layer
+        shared_features = self.localization_head["shared"](img_token_features)
+
+        refined_features = self.localization_ref_norm1(shared_features)
+        refined, _ = self.localization_ref_attn(refined_features, refined_features, refined_features)
+        refine_x = shared_features + refined
+        refine_x = refine_x + self.localization_ref_ffn(self.localization_ref_norm2(refine_x))
+
+        
+        shared_features = shared_features + refine_x
+
+        # Then through specialized prediction heads
+        bbox_preds = torch.sigmoid(self.localization_head["bbox_head"](shared_features))  # (B, num_tokens, 4)
+        objectness_logits = self.localization_head["objectness_head"](shared_features)    # (B, num_tokens, 1)
+        class_logits = self.localization_head["class_head"](shared_features)              # (B, num_tokens, num_classes)
 
         objectness_pred = torch.sigmoid(objectness_logits).squeeze(-1)  # (B, num_tokens)
-        class_pred = class_logits.argmax(dim=-1)  # (B, num_tokens)
+        class_probs = torch.softmax(class_logits, dim=-1)
+        class_pred = class_probs.argmax(dim=-1)
+
+        # --- Objectness gating ---
+        bbox_preds = bbox_preds * objectness_pred.unsqueeze(-1)
+
 
         # ----- 7  Loss -----
 
@@ -647,8 +689,15 @@ class ResnetGPT2Wrapper(nn.Module):
             # Optional: Add objectness loss
             objectness_loss = F.binary_cross_entropy_with_logits(objectness_logits, objectness_targets)
 
+            loss_bbox = criterion_losses["loss_bbox"]
+            loss_giou = criterion_losses["loss_giou"]
+
+            loss_bbox = torch.clamp(loss_bbox, max=5.0)    # prevents runaway gradients
+            loss_giou = torch.clamp(loss_giou, max=2.0)
+
             # Total loss
-            total_loss = lm_loss + criterion_losses["loss_bbox"] + criterion_losses["loss_giou"] + criterion_losses["loss_ce"] + 0.5 * objectness_loss
+            total_loss = lm_loss + 5.0 * loss_bbox + 2.0 * loss_giou + criterion_losses["loss_ce"] + 0.5 * objectness_loss
+
             return logits, bbox_preds, objectness_pred, class_pred, total_loss
 
         else:  # ----- mode == "inference" -----
