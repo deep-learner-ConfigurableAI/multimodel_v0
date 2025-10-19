@@ -299,7 +299,7 @@ class ResnetGPT2Wrapper(nn.Module):
             attention_layer = self.cross_attention_layers[0]
         
         # Process on CPU for stability
-        cpu_device = torch.device("mps")
+        cpu_device = torch.device("cpu")
         
         queries_cpu = queries.to(cpu_device)
         k_cpu = k.to(cpu_device)
@@ -680,9 +680,10 @@ class ResnetGPT2Wrapper(nn.Module):
             }
             targets_for_criterion = []
             for b in range(B):
+                valid_mask = class_targets[b] != -1  # filter padded labels
                 targets_for_criterion.append({
-                    "labels": class_targets[b],
-                    "boxes": bbox_targets[b]
+                    "labels": class_targets[b][valid_mask],
+                    "boxes": bbox_targets[b][valid_mask]
                 })
 
             criterion_losses = self.criterion(outputs_for_criterion, targets_for_criterion)
@@ -695,10 +696,13 @@ class ResnetGPT2Wrapper(nn.Module):
             loss_bbox = torch.clamp(loss_bbox, max=5.0)    # prevents runaway gradients
             loss_giou = torch.clamp(loss_giou, max=2.0)
 
+
             # Total loss
             total_loss = lm_loss + 5.0 * loss_bbox + 2.0 * loss_giou + criterion_losses["loss_ce"] + 0.5 * objectness_loss
 
-            return logits, bbox_preds, objectness_pred, class_pred, total_loss
+            loss_list = [total_loss, lm_loss, loss_bbox, loss_giou, criterion_losses['loss_ce'], objectness_loss]
+
+            return logits, bbox_preds, objectness_pred, class_pred, loss_list
 
         else:  # ----- mode == "inference" -----
             # Mask padding tokens to avoid attention to them
@@ -706,7 +710,8 @@ class ResnetGPT2Wrapper(nn.Module):
                 attention_mask = (captions_tensor != self.pad_token_id).long()
 
             probs = F.softmax(logits, dim=-1)
-            return logits, bbox_preds, objectness_pred, class_pred, None 
+            loss_list = [None, None, None , None , None, None ]
+            return logits, bbox_preds, objectness_pred, class_pred, loss_list
 
 
         # if attention_mask is not None:

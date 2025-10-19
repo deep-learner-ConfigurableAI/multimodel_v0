@@ -6,8 +6,12 @@ load_dotenv()
 
 device = torch.device("mps") 
 
+from torch.utils.data import Dataset
+from torchvision.datasets import CocoCaptions, CocoDetection
+from torchvision import transforms
 
-def freeze_model_layers(image_encoder, gpt_decoder, freeze_ratio=0.7):
+
+def freeze_model_layers(image_encoder, gpt_decoder, freeze_ratio=0.5):
 
     # Freeze CLIP completely
     for param in image_encoder.parameters():
@@ -128,6 +132,28 @@ def save_to_checkpoint(encoder, decoder, optimizer, epoch, loss, global_step, tm
     import os 
     os.replace(tmp_path, CHECKPOINT_PATH)   
 
+
+class CocoAlignedDataset(Dataset):
+    def __init__(self, root, caption_ann, detection_ann, transform=None):
+        self.caption_dataset = CocoCaptions(root=root, annFile=caption_ann, transform=transform)
+        self.detection_dataset = CocoDetection(root=root, annFile=detection_ann, transform=transform)
+        
+        # Map image_id -> index for each dataset
+        self.cap_id_to_idx = {img_id: idx for idx, img_id in enumerate(self.caption_dataset.ids)}
+        self.det_id_to_idx = {img_id: idx for idx, img_id in enumerate(self.detection_dataset.ids)}
+        
+        # Keep only common image IDs
+        self.common_ids = list(set(self.cap_id_to_idx.keys()) & set(self.det_id_to_idx.keys()))
+    
+    def __len__(self):
+        return len(self.common_ids)
+    
+    def __getitem__(self, idx):
+        image_id = self.common_ids[idx]
+        cap_img, captions = self.caption_dataset[self.cap_id_to_idx[image_id]]
+        det_img, targets = self.detection_dataset[self.det_id_to_idx[image_id]]
+        assert cap_img == det_img  # same image (torchvision reuses same file)
+        return cap_img, captions, targets
     
 
 
@@ -146,43 +172,28 @@ def setup_data(N, val_split=0.2):
         # transforms.ToTensor()
     ])
 
-
-    train_dataset_cocooptions = CocoCaptions(
+    dataset = CocoAlignedDataset(
         root='train2017',
-        annFile='annotations/captions_train2017.json',
+        caption_ann='annotations/captions_train2017.json',
+        detection_ann='annotations/instances_train2017.json',
         transform=transform
+        
     )
 
+    subset = torch.utils.data.Subset(dataset, range(N))
 
-    train_dataset_detection = CocoDetection(
-        root='train2017',
-        annFile='annotations/instances_train2017.json',
-        transform=transform
-    )
+    val_size = int(N * val_split)
+    train_size = N - val_size
+    train_dataset, val_dataset = torch.utils.data.random_split(subset, [train_size, val_size])
 
-    coco_api = train_dataset_detection.coco
+    # category maps
+    coco_api = dataset.detection_dataset.coco
     cat_ids = coco_api.getCatIds()
+    cats = coco_api.loadCats(cat_ids)
+    id_to_name = {cat["id"]: cat["name"] for cat in cats}
+    name_to_id = {cat["name"]: cat["id"] for cat in cats}
 
-    categories = coco_api.loadCats(cat_ids)
-
-    id_to_name = {cat["id"]: cat["name"] for cat in categories}
-    name_to_id = {cat["name"]: cat["id"] for cat in categories}
-
-    train_dataset_cocooptions = Subset(train_dataset_cocooptions, range(N))
-    train_dataset_detection = Subset(train_dataset_detection, range(N))
-
-    # split into train and validation
-    val_size = int(len(train_dataset_cocooptions) * val_split)
-    train_size = len(train_dataset_cocooptions) - val_size
-    train_dataset_cocooptions, val_dataset_cocooptions = random_split(train_dataset_cocooptions, [train_size, val_size])
-
-
-    val_size = int(len(train_dataset_detection) * val_split)
-    train_size = len(train_dataset_detection) - val_size
-    train_dataset_detection, val_dataset_detection = random_split(train_dataset_detection, [train_size, val_size])
-
-    return train_dataset_cocooptions, val_dataset_cocooptions, train_dataset_detection , val_dataset_detection, id_to_name, name_to_id 
-
+    return train_dataset, val_dataset, id_to_name, name_to_id
 
 
 

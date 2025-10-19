@@ -45,17 +45,19 @@ def get_models():
         gpt_hidden_size: ClassVar[int] = gpt_model.config.hidden_size
         embed_size: ClassVar[int] = gpt_hidden_size      # to match GPT hidden size
         hidden_size: ClassVar[int] = gpt_hidden_size
-        batch_size: ClassVar[int] = 16
+        batch_size: ClassVar[int] = 8
         input_channels: ClassVar[int] = 3
         image_h: ClassVar[int] = 224
         image_w: ClassVar[int] = 224
         steps: ClassVar[int] = 0
         epochs: ClassVar[int] = 10
-        lr: ClassVar[float] = 3e-4
+        lr: ClassVar[float] = 2e-4
         accumulation_steps: ClassVar[int] = 4
         vocab_size: ClassVar[int] = gpt_model.config.vocab_size
         number_of_items : ClassVar[int] = 80000
         caption_len : ClassVar[int] = 20 
+        save_every : ClassVar[int] = 1000
+        checkpoint_path : ClassVar[str] = "checkpoint.pth"
 
     encoder_model = CLIPEncoder(TrainingConfig.embed_size)
 
@@ -69,26 +71,22 @@ def get_models():
     print ("Trainable parameters in  model:")
     print (sum([p.numel() for p in all_params if p.requires_grad]))
 
-    decoder_model = decoder_model.to(device)
-    encoder_model = encoder_model.to(device)
-
     extras_dict = {}
 
-
-    if os.path.exists("checkpoint.pth") and FLAG:
-        encoder_model, decoder_model , epoch, loss , global_step, tokenizer = load_from_checkpoint()
-        print ("Loading from Checkpoint...!")
-        print (f"epoch {epoch}")
-        print (f"loss {loss}")
-        print (f"global_step {global_step}")
-        extras_dict["global_step"] = global_step
-        extras_dict["epoch"] = epoch
-        extras_dict["loss"] = loss 
-        encoder_model, gpt_model = freeze_model_layers(encoder_model, gpt_model)
-        return  TrainingConfig, encoder_model, decoder_model , pad_token_id, tokenizer, extras_dict
+    # if os.path.exists("checkpoint.pth") and FLAG:
+    #     encoder_model, decoder_model , epoch, loss , global_step, tokenizer = load_from_checkpoint()
+    #     print ("Loading from Checkpoint...!")
+    #     print (f"epoch {epoch}")
+    #     print (f"loss {loss}")
+    #     print (f"global_step {global_step}")
+    #     extras_dict["global_step"] = global_step
+    #     extras_dict["epoch"] = epoch
+    #     extras_dict["loss"] = loss 
+    #     encoder_model, gpt_model = freeze_model_layers(encoder_model, gpt_model)
+    #     return  TrainingConfig, encoder_model, decoder_model , pad_token_id, tokenizer, extras_dict
     
-    else:
-        print ("Checkpoint is not Found !!!")
+    # else:
+    #     print ("Checkpoint is not Found !!!")
 
     return TrainingConfig, encoder_model, decoder_model , pad_token_id, tokenizer, extras_dict
 

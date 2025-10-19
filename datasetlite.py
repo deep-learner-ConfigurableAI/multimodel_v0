@@ -13,20 +13,19 @@ class DataLoaderLite(Dataset):
 
     tokenizer = None 
 
-    def __init__(self, train_dataset_cocooptions, coco_detection_dataset, caption_length=20, num_img_tokens=64, tokenizer=tokenizer):
-        self.train_dataset_cocooptions = train_dataset_cocooptions
-        self.det_ds = coco_detection_dataset
+    def __init__(self, train_dataset, caption_length=20, num_img_tokens=64, tokenizer=tokenizer):
+        self.train_dataset = train_dataset
         self.caption_length = caption_length
         self.tokenizer = tokenizer 
         self.num_img_tokens = num_img_tokens
 
 
     def __len__(self):
-        return len(self.det_ds)
+        return len(self.train_dataset)
     
     def __getitem__(self, idx):
-        img, image_captions = self.train_dataset_cocooptions[idx]
-        img_d, det_target = self.det_ds[idx]
+        img, image_captions, det_target = self.train_dataset[idx]
+        
 
          # Apply CLIPProcessor
         image_tensor = clip_processor(images=img, return_tensors="pt")
@@ -45,7 +44,7 @@ class DataLoaderLite(Dataset):
             labels = torch.tensor([ann['category_id'] for ann in det_target], dtype=torch.int64)
 
             # Normalize [x, y, w, h] to [0,1]
-            img_w, img_h = img_d.size
+            img_w, img_h = img.size
             boxes[:, 0] /= img_w
             boxes[:, 1] /= img_h
             boxes[:, 2] /= img_w
