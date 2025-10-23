@@ -3,10 +3,10 @@ import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
+import math
 
 ### Decoder Block ####
 
-device = torch.device("mps")
 
 import torch
 from scipy.optimize import linear_sum_assignment
@@ -45,58 +45,116 @@ def generalized_box_iou(boxes1, boxes2):
     giou = iou - (area_enclose - union) / (area_enclose + 1e-7)
     return giou
 
+# Positional encoding helpers
+def get_2d_sincos_pos_embed(h, w, dim):
+    """Create standard 2D sine-cos positional embeddings (no learnable params).
+    Args:
+        h, w: spatial height & width
+        dim: embedding dimension (must be even)
+    Returns:
+        Tensor shape (h*w, dim)
+    """
+    if dim % 4 != 0:
+        # Fallback: pad to next multiple of 4 then slice
+        full_dim = (dim // 4 + 1) * 4
+    else:
+        full_dim = dim
+    pe = []
+    # Coordinate grids normalized to [0,1]
+    y = torch.linspace(0, 1, steps=h)
+    x = torch.linspace(0, 1, steps=w)
+    yy, xx = torch.meshgrid(y, x, indexing='ij')
+    # Split dims equally for (x,y) sin/cos
+    div_term = torch.exp(torch.arange(0, full_dim//4, 2, dtype=torch.float32) * (-math.log(10000.0) / (full_dim//4)))
+    def encode(coord):
+        # coord: (h,w)
+        coord = coord.unsqueeze(-1)
+        sinv = torch.sin(coord * div_term)
+        cosv = torch.cos(coord * div_term)
+        return torch.cat([sinv, cosv], dim=-1)
+    y_enc = encode(yy)
+    x_enc = encode(xx)
+    # Concatenate along last dim -> (h,w, dim')
+    pos = torch.cat([y_enc, x_enc], dim=-1)
+    pos = pos.view(h*w, -1)
+    if pos.shape[-1] > dim:
+        pos = pos[:, :dim]
+    elif pos.shape[-1] < dim:
+        # Pad remaining
+        pad = dim - pos.shape[-1]
+        pos = torch.cat([pos, torch.zeros(h*w, pad)], dim=-1)
+    return pos
+
+
 
 class HungarianMatcher(nn.Module):
     def __init__(self, cost_class=1, cost_bbox=5, cost_giou=2):
         super().__init__()
-        self.cost_class = cost_class
-        self.cost_bbox = cost_bbox
-        self.cost_giou = cost_giou
-        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "All costs can't be 0"
-
+        from transformers.models.detr.modeling_detr import DetrHungarianMatcher as HFMatcher
+        self.hf = HFMatcher(class_cost=cost_class, bbox_cost=cost_bbox, giou_cost=cost_giou)
+       
     @torch.no_grad()
     def forward(self, outputs, targets):
-        """
-        outputs: dict of tensors
-          - "bboxes": [B, num_queries, 4]
-          - "class_logits": [B, num_queries, num_classes]
-        targets: list of dicts
-          Each dict has:
-            - "labels": Tensor[num_gt]
-            - "boxes": Tensor[num_gt, 4]
-        """
-        bs, num_queries = outputs["class_logits"].shape[:2]
-        out_prob = outputs["class_logits"].softmax(-1)  # (B, num_queries, num_classes)
-        out_bbox = outputs["bboxes"]                   # (B, num_queries, 4)
+        return self.hf({'pred_logits': outputs['class_logits'], 'pred_boxes': outputs['bboxes']}, targets)
 
-        indices = []
-        for b in range(bs):
-            tgt_ids = targets[b]["labels"]
-            tgt_bbox = targets[b]["boxes"]
+class DeformableCrossAttention(nn.Module):
+    """Simplified deformable cross-attention: samples sparse points around learned offsets.
+    Not full MS-Deformable, but approximates focusing mechanism.
+    Args:
+        embed_dim: hidden size
+        num_heads: attention heads
+        num_points: sampled key points per head
+    """
+    def __init__(self, embed_dim, num_heads=8, num_points=4):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == embed_dim
+        self.num_points = num_points
+        # Projections
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        # Offsets per head and point (relative index positions)
+        self.offset_mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, num_heads * num_points)
+        )
+        self.scale = self.head_dim ** -0.5
 
-            # Compute classification cost
-            cost_class = -out_prob[b][:, tgt_ids]
+    def forward(self, query, key, value):
+        B, Q, D = query.shape
+        _, K, _ = key.shape
+        q = self.q_proj(query).view(B, Q, self.num_heads, self.head_dim)
+        k = self.k_proj(key).view(B, K, self.num_heads, self.head_dim)
+        v = self.v_proj(value).view(B, K, self.num_heads, self.head_dim)
 
-            # L1 cost between boxes
-            cost_bbox = torch.cdist(out_bbox[b], tgt_bbox, p=1)
-
-            # GIoU cost
-            cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox[b]), 
-                                             box_cxcywh_to_xyxy(tgt_bbox))
-
-            # Final cost matrix
-            C = (self.cost_class * cost_class
-               + self.cost_bbox * cost_bbox
-               + self.cost_giou * cost_giou)
-
-            C = C.cpu()
-            i, j = linear_sum_assignment(C)
-            indices.append((torch.as_tensor(i, dtype=torch.int64),
-                            torch.as_tensor(j, dtype=torch.int64)))
-
-        return indices
+        # Compute offsets -> indices
+        offsets = self.offset_mlp(query).view(B, Q, self.num_heads, self.num_points)
+        # Base index grid (uniform spanning K)
+        base = torch.linspace(0, K - 1, steps=self.num_points, device=query.device)
+        base = base.view(1, 1, 1, self.num_points).expand(B, Q, self.num_heads, self.num_points)
+        # Apply offsets (small)
+        offsets = torch.tanh(offsets) * (K / 32.0)
+        idx = base + offsets
+        idx = idx.clamp(0, K - 1)
+        # Gather sampled keys/values
+        idx_long = idx.round().long()  # (B,Q,H,P)
+        k_sample = k.gather(1, idx_long.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim))  # (B,Q,H,P,head_dim)
+        v_sample = v.gather(1, idx_long.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim))
+        # Compute attention weights between q and sampled k
+        q_exp = q.unsqueeze(3)  # (B,Q,H,1,head_dim)
+        attn_logits = (q_exp * k_sample).sum(-1) * self.scale  # (B,Q,H,P)
+        attn_weights = attn_logits.softmax(-1)
+        # Weighted sum
+        out = (attn_weights.unsqueeze(-1) * v_sample).sum(3)  # (B,Q,H,head_dim)
+        out = out.view(B, Q, D)
+        return self.out_proj(out), attn_weights.detach()
     
-    
+
 class SetCriterion(nn.Module):
     def __init__(self, num_classes, matcher, weight_dict):
         super().__init__()
@@ -106,16 +164,26 @@ class SetCriterion(nn.Module):
         self.losses = ['labels', 'boxes', 'giou']
 
     def loss_labels(self, outputs, targets, indices):
-        idx = self._get_src_permutation_idx(indices)
-        src_logits = outputs['class_logits'][idx]
+        """Simplified classification: only matched queries contribute; unmatched ignored."""
+        src_logits = outputs['class_logits']
+        matched_logits = []
+        matched_targets = []
 
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(src_logits.shape[:1], self.num_classes,
-                                    dtype=torch.int64, device=src_logits.device)
+        for b, (src_idx, tgt_idx) in enumerate(indices):
+            if tgt_idx.numel() == 0:
+                continue
+            matched_logits.append(src_logits[b, src_idx])
+            matched_targets.append(targets[b]['labels'][tgt_idx])
 
-        target_classes = target_classes.to(src_logits.device)
-        loss_ce = F.cross_entropy(src_logits, target_classes_o)
-        return {"loss_ce": loss_ce}
+        if not matched_logits:
+            return {'loss_ce': torch.zeros((), device=src_logits.device)}
+        
+        matched_logits = torch.cat(matched_logits, dim=0)
+        matched_targets = torch.cat(matched_targets, dim=0)
+
+        loss_ce = F.cross_entropy(matched_logits, matched_targets)
+
+        return {'loss_ce': loss_ce}
 
     def loss_boxes(self, outputs, targets, indices):
         idx = self._get_src_permutation_idx(indices)
@@ -163,19 +231,29 @@ class ResnetGPT2Wrapper(nn.Module):
         # 1. Learnable query embeddings
         self.query_tokens = nn.Parameter(torch.randn(1, num_img_tokens, embed_size) * 0.02)
         
-        # 2. Cross-attention layers (Q-Former has multiple layers)
-        self.cross_attention_layers = nn.ModuleList([
-            nn.MultiheadAttention(embed_dim=embed_size, num_heads=num_heads, batch_first=True, dropout=0.1)
-            for _ in range(2)  # Using 2 cross-attention layers
-        ])
-        
+        # Configurable depth
+        self.num_blocks = 4  # increase from 2 to 4 blocks (each: self-attn + cross-attn)
+
+        # 2. Cross-attention layers (Q-Former style) / optionally deformable
+        self.use_deformable = True  # flag to enable deformable cross-attn
+        if self.use_deformable:
+            self.cross_attention_layers = nn.ModuleList([
+                DeformableCrossAttention(embed_size, num_heads=num_heads, num_points=4)
+                for _ in range(self.num_blocks)
+            ])
+        else:
+            self.cross_attention_layers = nn.ModuleList([
+                nn.MultiheadAttention(embed_dim=embed_size, num_heads=num_heads, batch_first=True, dropout=0.1)
+                for _ in range(self.num_blocks)
+            ])
+
         # 3. Self-attention layers for query refinement
         self.self_attention_layers = nn.ModuleList([
             nn.MultiheadAttention(embed_dim=embed_size, num_heads=num_heads, batch_first=True, dropout=0.1)
-            for _ in range(2)  # Using 2 self-attention layers
+            for _ in range(self.num_blocks)
         ])
-        
-        # 4. FFN layers after each attention
+
+        # 4. FFN layers after each attention (2 per block: after self-attn, after cross-attn)
         self.ffn_layers = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(embed_size, 4 * embed_size),
@@ -184,13 +262,13 @@ class ResnetGPT2Wrapper(nn.Module):
                 nn.Linear(4 * embed_size, embed_size),
                 nn.Dropout(0.1)
             )
-            for _ in range(4)  # One for each attention layer
+            for _ in range(self.num_blocks * 2)
         ])
-        
-        # 5. Layer norms
+
+        # 5. Layer norms (4 per block: pre self, pre ffn1, pre cross, pre ffn2)
         self.layer_norms = nn.ModuleList([
             nn.LayerNorm(embed_size, eps=1e-6)
-            for _ in range(8)  # 2 per attention+ffn block
+            for _ in range(self.num_blocks * 4)
         ])
         
         # Final projections
@@ -223,12 +301,8 @@ class ResnetGPT2Wrapper(nn.Module):
         self.to("mps")
 
         self.cross_scale = nn.Parameter(torch.ones(1))
-
-
         ####  localization head for bounding box prediction
-
-        self.num_classes = 80  #COCO classes 
-
+        self.num_classes = 91  # raw COCO ids (1-90) plus slot for 0 if needed
 
         self.localization_ref_norm1 = nn.LayerNorm(embed_size, eps=1e-6)
         self.localization_ref_attn = nn.MultiheadAttention(embed_size, 8, batch_first=True)
@@ -245,8 +319,6 @@ class ResnetGPT2Wrapper(nn.Module):
                 nn.GELU(),
                 nn.Dropout(0.1)
             ),
-
-            # Bounding box prediction head (refined)
             "bbox_head": nn.Sequential(
                 nn.Linear(embed_size, embed_size // 2),
                 nn.LayerNorm(embed_size // 2, eps=1e-6),
@@ -256,16 +328,22 @@ class ResnetGPT2Wrapper(nn.Module):
                 nn.GELU(),
                 nn.Linear(embed_size // 4, 4)
             ),
-
-            # Objectness (confidence) head
+            "bbox_refine_head": nn.Sequential(
+                nn.Linear(embed_size, embed_size // 2),
+                nn.GELU(),
+                nn.Linear(embed_size // 2, 4)
+            ),
             "objectness_head": nn.Sequential(
                 nn.Linear(embed_size, embed_size // 2),
                 nn.LayerNorm(embed_size // 2, eps=1e-6),
                 nn.GELU(),
                 nn.Linear(embed_size // 2, 1)
             ),
-
-            # Classification head with residual refinement
+            "iou_head": nn.Sequential(
+                nn.Linear(embed_size, embed_size // 2),
+                nn.GELU(),
+                nn.Linear(embed_size // 2, 1)
+            ),
             "class_head": nn.Sequential(
                 nn.Linear(embed_size, embed_size),
                 nn.LayerNorm(embed_size, eps=1e-6),
@@ -275,11 +353,33 @@ class ResnetGPT2Wrapper(nn.Module):
             )
         })
 
+        # Auxiliary prediction head (deep supervision) after first cross-attn block
+        self.use_aux = True
+        self.aux_head = nn.ModuleDict({
+            "bbox_head": nn.Sequential(
+                nn.Linear(embed_size, embed_size // 2),
+                nn.GELU(),
+                nn.Linear(embed_size // 2, 4)
+            ),
+            "class_head": nn.Sequential(
+                nn.Linear(embed_size, embed_size),
+                nn.GELU(),
+                nn.Linear(embed_size, self.num_classes)
+            )
+        })
+
         self.matcher = HungarianMatcher(cost_class=1, cost_bbox=5, cost_giou=2)
-        self.criterion = SetCriterion(num_classes=80, matcher=self.matcher,
+        self.criterion = SetCriterion(num_classes=self.num_classes, matcher=self.matcher,
                                 weight_dict={'loss_ce': 1, 'loss_bbox': 5, 'loss_giou': 2})
 
         assert embed_size % num_heads == 0, "embed_size must be divisible by num_heads"
+
+        # Multiscale configuration
+        self.use_multiscale = True  # flag to enable pyramid features
+        self.pyramid_levels = 3     # number of additional pooled scales (besides base)
+        if self.use_multiscale:
+            self.scale_embed = nn.Embedding(self.pyramid_levels + 1, embed_size)
+            self.fpn_reduce = nn.Linear(embed_size, embed_size)  # optional projection per scale
 
    
 
@@ -315,6 +415,34 @@ class ResnetGPT2Wrapper(nn.Module):
         attention_layer.to("mps")
         
         return output.to("mps")
+
+    def _build_multiscale_features(self, img_features):
+        """Construct pyramid features by average pooling progressively.
+        Returns concatenated features with scale embeddings added.
+        img_features: (B, N, D) flattened spatial tokens.
+        Assumes original layout roughly square; reshapes for pooling.
+        """
+        B, N, D = img_features.shape
+        h = int(math.sqrt(N)); w = h
+        if h * w != N:
+            # Fallback: treat sequence as (N,1)
+            h, w = N, 1
+        feats = img_features.view(B, h, w, D).permute(0, 3, 1, 2)  # (B,D,H,W)
+        all_scales = []
+        for lvl in range(self.pyramid_levels + 1):
+            if lvl == 0:
+                f = feats
+            else:
+                # progressive pooling by 2 each level
+                f = F.avg_pool2d(feats, kernel_size=2**lvl, stride=2**lvl)
+            b, d, hh, ww = f.shape
+            flat = f.permute(0, 2, 3, 1).reshape(B, hh*ww, D)
+            scale_emb = self.scale_embed.weight[lvl].unsqueeze(0).unsqueeze(1)  # (1,1,D)
+            flat = flat + scale_emb
+            # optional projection
+            flat = self.fpn_reduce(flat)
+            all_scales.append(flat)
+        return torch.cat(all_scales, dim=1)  # (B, sum_tokens, D)
         
     def compute_token_similarities(self, global_context, query_tokens, img_features):
 
@@ -433,194 +561,243 @@ class ResnetGPT2Wrapper(nn.Module):
             plt.show()
 
     def forward(self, img_features, captions_tensor, attention_mask=None, bbox_targets=None, class_targets=None, objectness_targets=None, mode="train"):
-        """
-        Q-Former style forward pass for image-text integration
-        
-        Args:
-            img_features: Tensor of shape (B, N, D) - image features from encoder
-            captions_tensor: Tensor of shape (B, T) - caption token ids
-            attention_mask: Tensor of shape (B, T) - attention mask for captions
-            mode: 'train' or 'inference' - determines whether to compute loss
-        """
-        # Get token embeddings from the decoder model
+        """Clean forward with DN queries, deformable attention, attention pooling, and losses."""
         tok_embeds = self.gpt_decoder.get_input_embeddings()(captions_tensor)
-
-        # print (f"img_features: {img_features.shape}, tok_embeds: {tok_embeds.shape}")
-
-
-        # Ensure everything is on the same device
         img_features = img_features.to(tok_embeds.device)
-        
-        # Get batch size and dimensions
         B, T, D = tok_embeds.shape
         N = img_features.shape[1]
-        
-        # Expand query tokens to match batch size
-        query_tokens = self.query_tokens.expand(B, -1, -1)  # (B, num_img_tokens, D)
-        
-        # Add global context token to the beginning of query tokens
-        img_ctx = self.img_context.expand(B, 1, -1)  # (B, 1, D)
-        query_tokens = torch.cat([img_ctx, query_tokens], dim=1)  # (B, 1+num_img_tokens, D)
 
-        # print (f"query_tokens after adding global context: {query_tokens.shape}")
+        # Positional embeddings
+        if hasattr(self, 'pos_cache') and self.pos_cache.get(N) is not None:
+            pos_embed = self.pos_cache[N].to(img_features.device)
+        else:
+            h = int(math.sqrt(N)); w = h
+            if h*w != N: h, w = N, 1
+            pos_embed = get_2d_sincos_pos_embed(h, w, D).to(img_features.device)
+            if not hasattr(self, 'pos_cache'): self.pos_cache = {}
+            self.pos_cache[N] = pos_embed.detach()
+        img_features = img_features + pos_embed.unsqueeze(0)
 
-        
-        # Q-Former style processing with alternating self-attention and cross-attention
-        
-        # Layer 1: Self-attention for query tokens
-        norm_query = self.layer_norms[0](query_tokens)
+        # Base queries and denoising queries
+        base_query_tokens = self.query_tokens.expand(B, -1, -1)
+        dn_query_tokens = None; dn_class_targets = None; dn_bbox_targets = None; dn_token_features = None
+        if mode == 'train' and bbox_targets is not None and class_targets is not None:
+            max_dn = 10
+            dn_tokens=[]; dn_cls=[]; dn_boxes=[]
+            for b in range(B):
+                vm = class_targets[b] != -1
+                lbl = class_targets[b][vm]; box = bbox_targets[b][vm]
+                if box.numel()==0: continue
+                take = min(lbl.size(0), max_dn)
+                lbl = lbl[:take]; box = box[:take]
+                noise = torch.randn_like(box)*0.05
+                box_noisy = (box + noise).clamp(0,1)
+                onehot = F.one_hot(lbl, num_classes=self.num_classes).float()
+                concat = torch.cat([box_noisy, onehot], dim=-1)
+                if not hasattr(self,'dn_proj'): self.dn_proj = nn.Linear(4 + self.num_classes, self.embed_size)
+                dn_tok = self.dn_proj(concat)
+                dn_tokens.append(dn_tok.unsqueeze(0)); dn_cls.append(lbl); dn_boxes.append(box)
+            if dn_tokens:
+                dn_query_tokens = torch.zeros(B, max_dn, self.embed_size, device=img_features.device)
+                dn_class_targets = torch.full((B,max_dn), -1, dtype=torch.long, device=img_features.device)
+                dn_bbox_targets = torch.zeros(B,max_dn,4, device=img_features.device)
+                for b,dn_tok in enumerate(dn_tokens):
+                    t = dn_tok.size(1)
+                    dn_query_tokens[b,:t] = dn_tok.squeeze(0)
+                    dn_class_targets[b,:t] = dn_cls[b]
+                    dn_bbox_targets[b,:t] = dn_boxes[b]
+                    
+        query_tokens = torch.cat([dn_query_tokens, base_query_tokens], dim=1) if dn_query_tokens is not None else base_query_tokens
+        img_ctx = self.img_context.expand(B,1,-1)
+        query_tokens = torch.cat([img_ctx, query_tokens], dim=1)
 
-        self_attn_output, _ = self.self_attention_layers[0](
-            query=norm_query,
-            key=norm_query,
-            value=norm_query
-        )
+        # Project image features (single or multiscale)
+        if self.use_multiscale:
+            multi_feats = self._build_multiscale_features(img_features)
+            img_keys = self.key_proj(multi_feats)
+            img_values = self.value_proj(multi_feats)
+            key_token_count = img_keys.size(1)
+        else:
+            img_keys = self.key_proj(img_features)
+            img_values = self.value_proj(img_features)
+            key_token_count = img_keys.size(1)
 
-        query_tokens = query_tokens + self_attn_output
-        
-        # Layer 1: FFN after self-attention
-        norm_query = self.layer_norms[1](query_tokens)
-        ffn_output = self.ffn_layers[0](norm_query)
-        query_tokens = query_tokens + ffn_output
+        aux_bbox=None; aux_class_logits=None
+        for b_i in range(self.num_blocks):
+            ln = b_i*4; ffn = b_i*2
+            nq = self.layer_norms[ln](query_tokens)
+            self_out,_ = self.self_attention_layers[b_i](nq,nq,nq)
+            query_tokens = query_tokens + self_out
+            nq = self.layer_norms[ln+1](query_tokens)
+            query_tokens = query_tokens + self.ffn_layers[ffn](nq)
+            nq = self.layer_norms[ln+2](query_tokens)
+            if self.use_deformable:
+                cross_out, attn_w = self.cross_attention_layers[b_i](nq, img_keys, img_values)
+            else:
+                cross_out, attn_w = self.cross_attention_layers[b_i](query=nq, key=img_keys, value=img_values, need_weights=True, average_attn_weights=False)
+            if b_i == 0: self.last_cross_attn_weights_1 = attn_w.detach().cpu()
+            if b_i == 1: self.last_cross_attn_weights_2 = attn_w.detach().cpu()
+            self.last_cross_attn_weights = attn_w.detach().cpu()
+            query_tokens = query_tokens + cross_out
+            if b_i == 0 and self.use_aux:
+                aux_tokens = query_tokens[:,1:,:]
+                aux_bbox = torch.sigmoid(self.aux_head['bbox_head'](aux_tokens))
+                aux_class_logits = self.aux_head['class_head'](aux_tokens)
+            nq = self.layer_norms[ln+3](query_tokens)
+            query_tokens = query_tokens + self.ffn_layers[ffn+1](nq)
+        visual_tokens = query_tokens
 
-
-        # print ("Cross Attention about to start")
-
-        # print ("DTYPE AND DEVICE CHECK")
-        # print (f"norm_query: {norm_query.dtype}, {norm_query.device}")
-        # print (f"img_features: {img_features.dtype}, {img_features.device}")
-        # print (f"query_tokens: {query_tokens.dtype}, {query_tokens.device}")
-        # print (f"key_proj: {next(self.key_proj.parameters()).dtype}, {next(self.key_proj.parameters()).device}")
-        # print (f"value_proj: {next(self.value_proj.parameters()).dtype}, {next(self.value_proj.parameters()).device}")
-        # print (f"self.img_context: {self.img_context.dtype}, {self.img_context.device}")
-
-    
-
-        # Layer 1: Cross-attention with image features
-        norm_query = self.layer_norms[2](query_tokens)
-
-        img_keys = self.key_proj(img_features)
-
-        img_values = self.value_proj(img_features)
-
-
-        cross_attn_output, attn_weights_1 = self.cross_attention_layers[0](
-            query=norm_query,
-            key=img_keys,
-            value=img_values,
-            need_weights=True,
-            average_attn_weights=False
-        )
-
-        self.last_cross_attn_weights_1 = attn_weights_1.detach().cpu()
-
-
-        query_tokens = query_tokens + cross_attn_output
-        
-        # Layer 1: FFN after cross-attention
-        norm_query = self.layer_norms[3](query_tokens)
-        ffn_output = self.ffn_layers[1](norm_query)
-        query_tokens = query_tokens + ffn_output
-        
-
-
-        # Layer 2: Self-attention for query tokens
-        norm_query = self.layer_norms[4](query_tokens)
-        self_attn_output, _ = self.self_attention_layers[1](
-            query=norm_query,
-            key=norm_query,
-            value=norm_query
-        )
-
-        query_tokens = query_tokens + self_attn_output
-        
-        # Layer 2: FFN after self-attention
-        norm_query = self.layer_norms[5](query_tokens)
-        ffn_output = self.ffn_layers[2](norm_query)
-        query_tokens = query_tokens + ffn_output
-        
-        # Layer 2: Cross-attention with image features
-        norm_query = self.layer_norms[6](query_tokens)
-
-        cross_attn_output, attn_weights_2 = self.cross_attention_layers[1](
-            query=norm_query,
-            key=img_keys,
-            value=img_values,
-            need_weights=True,
-            average_attn_weights=False,
-        )
-
-        self.last_cross_attn_weights_2 = attn_weights_2.detach().cpu()
-
-        query_tokens = query_tokens + cross_attn_output
-        
-        # Layer 2: Final FFN
-        norm_query = self.layer_norms[7](query_tokens)
-        ffn_output = self.ffn_layers[3](norm_query)
-        visual_tokens = query_tokens + ffn_output
-        
-        # Extract global image context and query tokens
-        global_img_context = visual_tokens[:, 0:1, :]
-        img_token_features = visual_tokens[:, 1:, :]
-        
-        # Calculate cosine similarity if debug flag is enabled
+        global_img_context = visual_tokens[:,0:1,:]
+        if dn_query_tokens is not None:
+            dn_count = dn_query_tokens.size(1)
+            img_token_features = visual_tokens[:,1+dn_count:,:]
+            dn_token_features = visual_tokens[:,1:1+dn_count,:]
+        else:
+            img_token_features = visual_tokens[:,1:,:]
+            dn_token_features = None
         if self.debug_similarity:
             self.compute_token_similarities(global_img_context, img_token_features, img_features)
-        
 
-        ###NEED DEEP_RESEARCH ON THIS IF THIS MAKE SENSE 
-        # Conditioning: Use global context to influence text embeddings
-        #conditioned_tok_embeds = tok_embeds + global_img_context.expand(-1, T, -1) * 0.2
+        # Localization and refinement
+        shared_features = self.localization_head['shared'](img_token_features)
+        rf = self.localization_ref_norm1(shared_features)
+        refined,_ = self.localization_ref_attn(rf, rf, rf)
+        refine_x = shared_features + refined
+        refine_x = refine_x + self.localization_ref_ffn(self.localization_ref_norm2(refine_x))
+        shared_features = shared_features + refine_x
+        bbox_raw = self.localization_head['bbox_head'](shared_features)
+        bbox_preds = torch.sigmoid(bbox_raw)
+        bbox_refine_delta = torch.tanh(self.localization_head['bbox_refine_head'](shared_features))*0.1
+        bbox_refined = bbox_preds + bbox_refine_delta
+        objectness_logits = self.localization_head['objectness_head'](shared_features)
+        iou_logits = self.localization_head['iou_head'](shared_features)
+        attn_source = getattr(self,'last_cross_attn_weights', None)
+        fused_class_features = shared_features
 
-        # ----- Prepare decoder text embeddings -----
-        #text_embeds = tok_embeds + 0.2 * global_img_context.expand(-1, T, -1)  # light conditioning only
+        if attn_source is not None:
+            attn_t = attn_source.to(shared_features.device)
+            if attn_t.dim()==4 and attn_t.size(1)!=getattr(self,'num_heads',attn_t.size(1)):
+                attn_t = attn_t.permute(0,2,1,3)
+            attn_mean = attn_t.mean(1)
+            attn_queries = attn_mean[:,1:,:]
+            key_len = attn_queries.size(-1)
+            # Choose corresponding base feats slice (multiscale may increase key length)
+            if self.use_multiscale:
+                # Recompute multi_feats (already computed as multi_feats above)
+                base_feats = multi_feats[:, :key_len, :]
+            else:
+                base_feats = img_features[:, :key_len, :]
+            pooled = torch.matmul(attn_queries, base_feats)
+            fused_class_features = fused_class_features + pooled
+        class_logits = self.localization_head['class_head'](fused_class_features)
+        objectness_pred = torch.sigmoid(objectness_logits).squeeze(-1)
+        iou_pred = torch.sigmoid(iou_logits).squeeze(-1)
+        class_pred = class_logits.softmax(-1).argmax(-1)
+        logits = torch.tensor([[1]], device=img_features.device)
+        if mode != 'train':
+            return logits, bbox_preds, objectness_pred, class_pred, [None]*6
 
-        text_embeds = tok_embeds   # removing global context influence to see impact of just cross or query tokens
+        # Criterion targets
+        outputs_for_criterion = {'bboxes': bbox_refined.detach(), 'class_logits': class_logits}
+        targets_for_criterion = []
+        for b in range(B):
+            vm = class_targets[b] != -1
+            lbl = class_targets[b][vm]; box = bbox_targets[b][vm]
+            if box.numel()>0:
+                wh = box[:,2:4]; ndm = (wh[:,0]>0) & (wh[:,1]>0)
+                lbl = lbl[ndm]; box = box[ndm]
+            targets_for_criterion.append({'labels': lbl, 'boxes': box})
+        criterion_losses = self.criterion(outputs_for_criterion, targets_for_criterion)
+        if self.use_aux and aux_bbox is not None:
+            aux_outputs = {'bboxes': aux_bbox, 'class_logits': aux_class_logits}
+            aux_losses = self.criterion(aux_outputs, targets_for_criterion)
 
+        # Objectness focal loss
+        with torch.no_grad():
+            pos_mask = objectness_targets.squeeze(-1)==1
+            neg_mask_all = objectness_targets.squeeze(-1)==0
+            sampled_neg_mask = torch.zeros_like(neg_mask_all)
+            for b in range(B):
+                pc = pos_mask[b].sum().item(); neg_idx = torch.nonzero(neg_mask_all[b]).view(-1)
+                if pc>0 and neg_idx.numel()>0:
+                    k = min(pc, neg_idx.numel())
+                    chosen = neg_idx[torch.randperm(neg_idx.numel(), device=neg_idx.device)[:k]]
+                    sampled_neg_mask[b, chosen] = True
+            bce_mask = pos_mask | sampled_neg_mask
+        masked_logits = objectness_logits.squeeze(-1)[bce_mask]
+        masked_targets = objectness_targets.squeeze(-1)[bce_mask]
+        def focal_loss(logits, targets, alpha=0.25, gamma=2.0):
+            if logits.numel()==0: return torch.zeros((), device=logits.device)
+            prob = torch.sigmoid(logits); pt = prob*targets + (1-prob)*(1-targets)
+            w = alpha*targets + (1-alpha)*(1-targets)
+            loss_bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+            return (w * (1-pt).pow(gamma) * loss_bce).mean()
+        objectness_loss = focal_loss(masked_logits, masked_targets)
 
+        # IoU supervision
+        matched_idx = self.matcher(outputs_for_criterion, targets_for_criterion)
+        iou_supervision = torch.zeros((), device=img_features.device)
+        if matched_idx:
+            batch_ids=[]; pred_ids=[]; tgt_ious=[]
+            for b_i,(src_i,tgt_i) in enumerate(matched_idx):
+                if src_i.numel()==0: continue
+                pred_m = bbox_refined[b_i, src_i]; tgt_m = bbox_targets[b_i][class_targets[b_i]!=-1][tgt_i]
+                giou_mat = generalized_box_iou(box_cxcywh_to_xyxy(pred_m), box_cxcywh_to_xyxy(tgt_m))
+                pair = torch.diag(giou_mat).clamp(0,1)
+                batch_ids.append(torch.full_like(src_i, b_i)); pred_ids.append(src_i); tgt_ious.append(pair)
+            if tgt_ious:
+                batch_ids=torch.cat(batch_ids); pred_ids=torch.cat(pred_ids); tgt_ious=torch.cat(tgt_ious)
+                pred_iou_vals = iou_pred[batch_ids, pred_ids]
+                iou_supervision = F.smooth_l1_loss(pred_iou_vals, tgt_ious, reduction='mean')
 
-        # print (f"conditioned_tok_embeds: {conditioned_tok_embeds.shape}")
+        # Denoising direct losses
+        dn_loss_ce = torch.zeros((), device=img_features.device); dn_loss_bbox = torch.zeros((), device=img_features.device); dn_loss_giou = torch.zeros((), device=img_features.device)
+        if dn_token_features is not None and dn_class_targets is not None:
+            dn_shared = self.localization_head['shared'](dn_token_features)
+            dn_bbox = torch.sigmoid(self.localization_head['bbox_head'](dn_shared))
+            dn_class_logits = self.localization_head['class_head'](dn_shared)
+            dn_valid = dn_class_targets != -1
+            if dn_valid.any():
+                dn_loss_ce = F.cross_entropy(dn_class_logits[dn_valid], dn_class_targets[dn_valid])
+                dn_loss_bbox = F.l1_loss(dn_bbox[dn_valid], dn_bbox_targets[dn_valid], reduction='mean')
+                giou_dn = generalized_box_iou(box_cxcywh_to_xyxy(dn_bbox[dn_valid]), box_cxcywh_to_xyxy(dn_bbox_targets[dn_valid]))
+                dn_loss_giou = 1 - torch.diag(giou_dn).mean()
 
-
-        
-        # Concatenate visual tokens with conditioned text embeddings
-        #fused = torch.cat([img_token_features, conditioned_tok_embeds], dim=1)
-        # fused = torch.cat([visual_tokens, conditioned_tok_embeds], dim=1)
-
-
-        # print (f"fused: {fused.shape}")
-        
-        # Final dropout for regularization
-        #inputs_embeds = self.dropout(fused).contiguous()
-
-        inputs_embeds = self.dropout(text_embeds).contiguous()
+        loss_bbox = criterion_losses['loss_bbox']; loss_giou = criterion_losses['loss_giou']; loss_ce = criterion_losses['loss_ce']
+        lm_loss = torch.zeros((), device=img_features.device)
+        total_loss = loss_bbox + loss_giou + loss_ce + 0.1*objectness_loss + 0.2*iou_supervision + 0.3*(dn_loss_ce+dn_loss_bbox+dn_loss_giou) + lm_loss
+        loss_list = [total_loss, lm_loss, loss_bbox, loss_giou, loss_ce, objectness_loss, iou_supervision, dn_loss_ce, dn_loss_bbox, dn_loss_giou]
+        if self.use_aux and aux_bbox is not None:
+            total_loss = total_loss + 0.5*(aux_losses['loss_bbox'] + aux_losses['loss_giou'] + aux_losses['loss_ce'])
+            loss_list.insert(6, aux_losses['loss_bbox']); loss_list.insert(7, aux_losses['loss_giou']); loss_list.insert(8, aux_losses['loss_ce']); loss_list[0] = total_loss
+        return logits, bbox_preds, objectness_pred, class_pred, loss_list
 
 
         ###TO BE ON SAFE SIDE
         attention_mask = (captions_tensor != self.pad_token_id).long()
 
         # GPT self-attn runs first (inside decoder)
-        text_hidden_states = self.gpt_decoder.transformer(inputs_embeds=inputs_embeds, attention_mask=attention_mask).last_hidden_state
+        #text_hidden_states = self.gpt_decoder.transformer(inputs_embeds=inputs_embeds, attention_mask=attention_mask).last_hidden_state
 
 
         # Explicit cross-attention: text (query) attends to visual tokens (key/value)
-        cross_query = self.decoder_cross_attn_norm(text_hidden_states)
+        #cross_query = self.decoder_cross_attn_norm(text_hidden_states)
 
         # Create key padding mask for image (usually none)
         image_pad_mask = torch.zeros(B, visual_tokens.size(1), dtype=torch.bool, device=visual_tokens.device)
 
 
-        cross_out, cross_weights = self.decoder_cross_attn(
-            query=cross_query,
-            key=visual_tokens,
-            value=visual_tokens,
-            key_padding_mask=image_pad_mask,
-            need_weights=True,
-            average_attn_weights=False
-        )
-        self.decoder_last_cross_attn_weights = cross_weights.detach().cpu()
+        # cross_out, cross_weights = self.decoder_cross_attn(
+        #     query=cross_query,
+        #     key=visual_tokens,
+        #     value=visual_tokens,
+        #     key_padding_mask=image_pad_mask,
+        #     need_weights=True,
+        #     average_attn_weights=False
+        # )
+        #self.decoder_last_cross_attn_weights = cross_weights.detach().cpu()
 
-        self.all_cross_attn.append(cross_weights.detach().cpu())
+        #self.all_cross_attn.append(cross_weights.detach().cpu())
 
         # print (f"cross_out shape {cross_out.shape}")
         # print (f"cross_weights shape {cross_weights.shape}")
@@ -628,16 +805,16 @@ class ResnetGPT2Wrapper(nn.Module):
 
         # Residual + FFN
         # cross_out = text_hidden_states + cross_out
-        cross_out = text_hidden_states + self.cross_scale * cross_out
+        #cross_out = text_hidden_states + self.cross_scale * cross_out
 
 
 
 
-        cross_out = cross_out + self.decoder_cross_attn_ffn(self.decoder_cross_attn_norm2(cross_out))
-        cross_out = self.dropout(cross_out)
+        #cross_out = cross_out + self.decoder_cross_attn_ffn(self.decoder_cross_attn_norm2(cross_out))
+        #cross_out = self.dropout(cross_out)
 
         # ----- 6️  Prediction head -----
-        logits = self.gpt_decoder.lm_head(cross_out)
+        #logits = self.gpt_decoder.lm_head(cross_out)
         # Localization head predictions
 
         # First pass through shared embedding layer
@@ -651,171 +828,194 @@ class ResnetGPT2Wrapper(nn.Module):
         
         shared_features = shared_features + refine_x
 
-        # Then through specialized prediction heads
-        bbox_preds = torch.sigmoid(self.localization_head["bbox_head"](shared_features))  # (B, num_tokens, 4)
-        objectness_logits = self.localization_head["objectness_head"](shared_features)    # (B, num_tokens, 1)
-        class_logits = self.localization_head["class_head"](shared_features)              # (B, num_tokens, num_classes)
+    # Then through specialized prediction heads
+    bbox_raw = self.localization_head["bbox_head"](shared_features)
+    bbox_preds = torch.sigmoid(bbox_raw)
+    bbox_refine_delta = torch.tanh(self.localization_head["bbox_refine_head"](shared_features)) * 0.1
+    bbox_refined = bbox_preds + bbox_refine_delta  # local refinement
+    objectness_logits = self.localization_head["objectness_head"](shared_features)
+    iou_logits = self.localization_head["iou_head"](shared_features)
+    
+    # Attention-weight pooled features for class head
+    # Use attention weights from last cross-attn block (stored in self.last_cross_attn_weights_2 if exists, else last_cross_attn_weights_1)
+    attn_source = getattr(self, 'last_cross_attn_weights_2', None)
+    if attn_source is None:
+        attn_source = getattr(self, 'last_cross_attn_weights_1', None)
+    if attn_source is not None:
+        # attn_source shape: (B, num_heads, query_len, key_len)
+        # We exclude global token for class predictions (query_tokens without first)
+        attn_weights_final = attn_source  # cpu tensor
+        attn_weights_final = attn_weights_final.to(shared_features.device)
+        # Aggregate heads
+        attn_agg = attn_weights_final.mean(1)  # (B, Q, K)
+        # Remove global query (assumed first)
+        attn_queries = attn_agg[:, 1:, :]  # (B, num_img_tokens, K)
+        # Project original img_features (B,N,D) -> we already added positional embed; pool over keys (N)
+        # If key_len differs from N (e.g., due to padding), clamp
+        key_len = attn_queries.size(-1)
+        base_img_feats = img_features[:, :key_len, :]
+        pooled = torch.matmul(attn_queries, base_img_feats)  # (B, num_img_tokens, D)
+        # Fuse pooled with shared_features
+        fused_class_features = shared_features + pooled
+    else:
+        fused_class_features = shared_features
+    class_logits = self.localization_head["class_head"](fused_class_features)
 
-        objectness_pred = torch.sigmoid(objectness_logits).squeeze(-1)  # (B, num_tokens)
-        class_probs = torch.softmax(class_logits, dim=-1)
-        class_pred = class_probs.argmax(dim=-1)
+    objectness_pred = torch.sigmoid(objectness_logits).squeeze(-1)
+    iou_pred = torch.sigmoid(iou_logits).squeeze(-1)
+    class_pred = class_logits.softmax(-1).argmax(-1)
 
-        # --- Objectness gating ---
-        bbox_preds = bbox_preds * objectness_pred.unsqueeze(-1)
+    # ----- 7  Loss -----
+    loss = None
 
-
-        # ----- 7  Loss -----
-
-        loss = None
-        if mode == "train":
-            loss_fct = nn.CrossEntropyLoss(ignore_index=self.pad_token_id)
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = captions_tensor[:, 1:].contiguous()
-            lm_loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
+    logits = torch.tensor([[1]])
+    if mode == "train":
+            #loss_fct = nn.CrossEntropyLoss(ignore_index=self.pad_token_id)
+            #shift_logits = logits[:, :-1, :].contiguous()
+            #shift_labels = captions_tensor[:, 1:].contiguous()
+            #lm_loss = loss_fct(shift_logits.view(-1, self.vocab_size), shift_labels.view(-1))
 
             # 2. Hungarian + SetCriterion for boxes + class
             outputs_for_criterion = {
-                "bboxes": bbox_preds,
+                "bboxes": bbox_refined.detach(),  # use refined for matching, detach to keep gradients stable
                 "class_logits": class_logits
             }
             targets_for_criterion = []
             for b in range(B):
-                valid_mask = class_targets[b] != -1  # filter padded labels
+                # filter padded labels
+                valid_mask = class_targets[b] != -1
+                filtered_labels = class_targets[b][valid_mask]
+                filtered_boxes = bbox_targets[b][valid_mask]
+                if filtered_boxes.numel() > 0:
+                    # boxes are cx,cy,w,h normalized; zero-area if w==0 or h==0
+                    box_wh = filtered_boxes[:, 2:4]
+                    nondeg_mask = (box_wh[:, 0] > 0) & (box_wh[:, 1] > 0)
+                    filtered_labels = filtered_labels[nondeg_mask]
+                    filtered_boxes = filtered_boxes[nondeg_mask]
                 targets_for_criterion.append({
-                    "labels": class_targets[b][valid_mask],
-                    "boxes": bbox_targets[b][valid_mask]
+                    "labels": filtered_labels,
+                    "boxes": filtered_boxes
                 })
 
             criterion_losses = self.criterion(outputs_for_criterion, targets_for_criterion)
+            # Denoising losses (direct supervision, skip matcher)
+            dn_loss_ce = torch.zeros((), device=tok_embeds.device)
+            dn_loss_bbox = torch.zeros((), device=tok_embeds.device)
+            dn_loss_giou = torch.zeros((), device=tok_embeds.device)
+            if dn_token_features is not None:
+                # Predict for dn tokens using same heads
+                dn_shared = self.localization_head["shared"](dn_token_features)
+                dn_bbox = torch.sigmoid(self.localization_head["bbox_head"](dn_shared))
+                dn_class_logits = self.localization_head["class_head"](dn_shared)
+                # Valid mask
+                dn_valid = dn_class_targets != -1
+                if dn_valid.any():
+                    dn_flat_logits = dn_class_logits[dn_valid]
+                    dn_flat_targets = dn_class_targets[dn_valid]
+                    dn_loss_ce = F.cross_entropy(dn_flat_logits, dn_flat_targets)
+                    dn_flat_bbox = dn_bbox[dn_valid]
+                    dn_flat_tgt_bbox = dn_bbox_targets[dn_valid]
+                    dn_loss_bbox = F.l1_loss(dn_flat_bbox, dn_flat_tgt_bbox, reduction='mean')
+                    dn_flat_bbox_xyxy = box_cxcywh_to_xyxy(dn_flat_bbox)
+                    dn_flat_tgt_xyxy = box_cxcywh_to_xyxy(dn_flat_tgt_bbox)
+                    giou_mat = generalized_box_iou(dn_flat_bbox_xyxy, dn_flat_tgt_xyxy)
+                    dn_loss_giou = 1 - torch.diag(giou_mat).mean()
+            if self.use_aux:
+                aux_outputs = {"bboxes": aux_bbox, "class_logits": aux_class_logits}
+                aux_losses = self.criterion(aux_outputs, targets_for_criterion)
+
             # Optional: Add objectness loss
-            objectness_loss = F.binary_cross_entropy_with_logits(objectness_logits, objectness_targets)
+            # Masked objectness loss: compute BCE only on real objects and a sample of negatives
+
+            with torch.no_grad():
+                pos_mask = objectness_targets.squeeze(-1) == 1
+                neg_mask_all = objectness_targets.squeeze(-1) == 0
+                # sample at most same number of negatives as positives for balance
+                sampled_neg_mask = torch.zeros_like(neg_mask_all)
+                for b in range(B):
+                    pos_count = pos_mask[b].sum().item()
+                    neg_indices = torch.nonzero(neg_mask_all[b]).view(-1)
+                    if pos_count > 0 and neg_indices.numel() > 0:
+                        k = min(pos_count, neg_indices.numel())
+                        sampled = neg_indices[torch.randperm(neg_indices.numel(), device=neg_indices.device)[:k]]
+                        sampled_neg_mask[b, sampled] = True
+                bce_mask = pos_mask | sampled_neg_mask
+            masked_logits = objectness_logits.squeeze(-1)[bce_mask]
+            masked_targets = objectness_targets.squeeze(-1)[bce_mask]
+
+            # Focal loss for objectness
+            def focal_loss(logits, targets, alpha=0.25, gamma=2.0):
+                if logits.numel() == 0:
+                    return torch.zeros((), device=logits.device)
+                prob = torch.sigmoid(logits)
+                pt = prob * targets + (1 - prob) * (1 - targets)
+                w = alpha * targets + (1 - alpha) * (1 - targets)
+                loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+                loss = w * (1 - pt).pow(gamma) * loss
+                return loss.mean()
+
+            objectness_loss = focal_loss(masked_logits, masked_targets)
 
             loss_bbox = criterion_losses["loss_bbox"]
             loss_giou = criterion_losses["loss_giou"]
 
-            loss_bbox = torch.clamp(loss_bbox, max=5.0)    # prevents runaway gradients
-            loss_giou = torch.clamp(loss_giou, max=2.0)
+            if self.use_aux:
+                aux_loss_bbox = aux_losses["loss_bbox"]
+                aux_loss_giou = aux_losses["loss_giou"]
+                aux_loss_ce = aux_losses["loss_ce"]
+
+            lm_loss = torch.zeros(B, device=tok_embeds.device, requires_grad=True).mean()
 
 
             # Total loss
-            total_loss = lm_loss + 5.0 * loss_bbox + 2.0 * loss_giou + criterion_losses["loss_ce"] + 0.5 * objectness_loss
+            # IoU supervision: match predicted IoU for the matched queries (reuse indices from criterion)
+            matched_idx = self.criterion.matcher(outputs_for_criterion, targets_for_criterion)
+            iou_supervision = torch.zeros((), device=tok_embeds.device)
+            if matched_idx:
+                batch_ids = []
+                pred_ids = []
+                target_ious = []
+                for b_i, (src_i, tgt_i) in enumerate(matched_idx):
+                    if src_i.numel() == 0:
+                        continue
+                    # predicted refined boxes for matched queries
+                    matched_pred = bbox_refined[b_i, src_i]
+                    matched_tgt = bbox_targets[b_i][class_targets[b_i] != -1][tgt_i]
+                    pred_xyxy = box_cxcywh_to_xyxy(matched_pred)
+                    tgt_xyxy = box_cxcywh_to_xyxy(matched_tgt)
+                    giou_mat = generalized_box_iou(pred_xyxy, tgt_xyxy)
+                    # diag as pairwise matches
+                    pair_giou = torch.diag(giou_mat)
+                    batch_ids.append(torch.full_like(src_i, b_i))
+                    pred_ids.append(src_i)
+                    target_ious.append(pair_giou.clamp(0,1))
+                if target_ious:
+                    batch_ids = torch.cat(batch_ids)
+                    pred_ids = torch.cat(pred_ids)
+                    target_ious = torch.cat(target_ious)
+                    pred_iou_vals = iou_pred[batch_ids, pred_ids]
+                    iou_supervision = F.smooth_l1_loss(pred_iou_vals, target_ious, reduction='mean')
+            total_loss = loss_bbox + loss_giou + criterion_losses["loss_ce"] + 0.1 * objectness_loss + 0.2 * iou_supervision + lm_loss + 0.3 * (dn_loss_ce + dn_loss_bbox + dn_loss_giou)
+            if self.use_aux:
+                total_loss = total_loss + 0.5 * (aux_loss_bbox + aux_loss_giou + aux_loss_ce)
 
-            loss_list = [total_loss, lm_loss, loss_bbox, loss_giou, criterion_losses['loss_ce'], objectness_loss]
+            if self.use_aux:
+                loss_list = [total_loss, lm_loss, loss_bbox, loss_giou, criterion_losses['loss_ce'], objectness_loss,
+                             aux_loss_bbox, aux_loss_giou, aux_loss_ce, iou_supervision, dn_loss_ce, dn_loss_bbox, dn_loss_giou]
+            else:
+                loss_list = [total_loss, lm_loss, loss_bbox, loss_giou, criterion_losses['loss_ce'], objectness_loss, iou_supervision, dn_loss_ce, dn_loss_bbox, dn_loss_giou]
 
             return logits, bbox_preds, objectness_pred, class_pred, loss_list
 
-        else:  # ----- mode == "inference" -----
+    else:  # ----- mode == "inference" -----
             # Mask padding tokens to avoid attention to them
-            if attention_mask is None:
-                attention_mask = (captions_tensor != self.pad_token_id).long()
+            # if attention_mask is None:
+            #     attention_mask = (captions_tensor != self.pad_token_id).long()
 
-            probs = F.softmax(logits, dim=-1)
+            # probs = F.softmax(logits, dim=-1)
             loss_list = [None, None, None , None , None, None ]
             return logits, bbox_preds, objectness_pred, class_pred, loss_list
 
 
-        # if attention_mask is not None:
-        #     B, T = captions_tensor.size()
-        #     # Total number of visual tokens (query tokens + global context)
-        #     #img_tokens = self.num_img_tokens + 1  # +1 for global context
-        #     img_tokens = self.num_img_tokens  # +1 for global context
-
-        #     #seq_len = inputs_embeds.size(1)  # num_img_tokens + T (text)
-
-        #     seq_len = inputs_embeds.size(1)  #T (text)
-
-
-        #     print (f"seq_length :\t {seq_len}")
-
-        #     # --- Step 1: Create bidirectional mask for visual tokens ---
-        #     # Q-Former visual tokens use bidirectional attention among themselves
-        #     img_mask = torch.ones(B, img_tokens, device=tok_embeds.device)
-            
-        #     # --- Step 2: Combine with text attention mask ---
-        #     #full_mask = torch.cat([img_mask, attention_mask], dim=1)  # (B, img_tokens+T)
-
-        #     full_mask = attention_mask  # (B, T)
-
-
-        #     # print (f"full_mask {full_mask.shape}")
-            
-        #     # --- Step 3: Create Q-Former style attention pattern ---
-        #     # Create bidirectional mask for visual tokens and causal mask for text tokens
-        #     # Visual tokens see all visual tokens, text tokens see all visual tokens and previous text tokens
-            
-        #     # Initialize with zeros
-        #     full_attention_mask = torch.zeros((seq_len, seq_len), device=tok_embeds.device)
-
-
-        #     # print (f"full_attention_mask {full_attention_mask.shape}")
-        #     # print (f"img_tokens {img_tokens}")
-
-            
-        #     # Visual-to-visual: bidirectional attention (all 1s in top-left)
-        #     # full_attention_mask[:img_tokens, :img_tokens] = 1
-            
-        #     # Text-to-visual: full attention to all visual tokens (all 1s in bottom-left)
-        #     # full_attention_mask[img_tokens:, :img_tokens] = 1
-            
-        #     # Text-to-text: causal attention (lower triangle in bottom-right)
-        #     # This ensures autoregressive text generation
-        #     text_causal_mask = torch.tril(torch.ones((T, T), device=tok_embeds.device))
-
-        #     # print (f"SHAPE ATTENTION", "*"*10)
-
-        #     # print (full_attention_mask[img_tokens:, img_tokens:].shape)
-
-
-
-        #     full_attention_mask[img_tokens:, img_tokens:] = text_causal_mask
-            
-        #     # Expand to 4D for batch and attention heads
-        #     full_attention_mask = full_attention_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
-            
-        #     # Create padding mask from the original attention mask
-        #     padding_mask = full_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, seq_len)
-            
-        #     # Combine attention pattern with padding mask
-        #     attention_mask = full_attention_mask * padding_mask
-
-
-
-        # # Prepare labels for training
-        # labels = None 
-        # if mode == 'train':
-        #     # For text tokens, we use the original caption tokens
-        #     labels = captions_tensor[:, :].contiguous()
-            
-        #     # For visual tokens, we use padding tokens (these will be ignored in loss)
-        #     # Include all visual tokens (query tokens + global context)
-        #     pad_for_img = torch.full((B, self.num_img_tokens + 1), 
-        #                             self.pad_token_id, 
-        #                             dtype=torch.long, 
-        #                             device=tok_embeds.device)
-            
-        #     # Concatenate padding for visual tokens with text labels
-        #     labels = torch.cat([pad_for_img, labels], dim=1)   # (B, 1+num_img_tokens+T)
-
-
-        # if mode == "train":
-        #     outputs = self.gpt_decoder(
-        #         inputs_embeds=inputs_embeds,
-        #         attention_mask=attention_mask,
-        #         labels=labels
-        #     )
-        # else:  # inference
-        #     outputs = self.gpt_decoder(
-        #         inputs_embeds=inputs_embeds,
-        #         attention_mask=attention_mask
-        #     )
-
-
-        # outputs = self.gpt_decoder(
-        #     inputs_embeds=inputs_embeds,
-        #     attention_mask=attention_mask,
-        #     img_feats=img_features, 
-        #     labels=labels
-        # )
-
-        # return outputs.logits, outputs.loss 
-        #return outputs["logits"], outputs["loss"]
+      
+       

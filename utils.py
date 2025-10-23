@@ -143,7 +143,11 @@ class CocoAlignedDataset(Dataset):
         self.det_id_to_idx = {img_id: idx for idx, img_id in enumerate(self.detection_dataset.ids)}
         
         # Keep only common image IDs
-        self.common_ids = list(set(self.cap_id_to_idx.keys()) & set(self.det_id_to_idx.keys()))
+        #self.common_ids = list(set(self.cap_id_to_idx.keys()) & set(self.det_id_to_idx.keys()))
+        self.common_ids = [
+                img_id for img_id in set(self.cap_id_to_idx.keys()) & set(self.det_id_to_idx.keys())
+                if len(self.detection_dataset.coco.getAnnIds(imgIds=[img_id])) > 0
+            ]
     
     def __len__(self):
         return len(self.common_ids)
@@ -152,10 +156,15 @@ class CocoAlignedDataset(Dataset):
         image_id = self.common_ids[idx]
         cap_img, captions = self.caption_dataset[self.cap_id_to_idx[image_id]]
         det_img, targets = self.detection_dataset[self.det_id_to_idx[image_id]]
-        assert cap_img == det_img  # same image (torchvision reuses same file)
-        return cap_img, captions, targets
-    
 
+        # --- Get original width and height from COCO metadata ---
+        img_info = self.detection_dataset.coco.loadImgs(image_id)[0]
+        orig_w, orig_h = img_info["width"], img_info["height"]
+
+        assert cap_img == det_img  # same image (torchvision reuses same file)
+        assert len(targets)!=0
+        return cap_img, captions, targets, orig_h, orig_w
+    
 
 
 def setup_data(N, val_split=0.2):

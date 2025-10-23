@@ -29,3 +29,6 @@ model_safetensors/
 *.ckpt
 *.pth
 *.bin
+grounding_dino_tiny_local
+clip-vit-base-patch32
+coco_ref
