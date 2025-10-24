@@ -102,9 +102,8 @@ def freeze_model_layers(image_encoder, gpt_decoder, freeze_ratio=0.5):
 
 
 
-def calculate_total_train_params(image_encoder, caption_encoder):
-    all_params = list([param for param in image_encoder.parameters() if param.requires_grad]) 
-    all_params +=  list([param for param in caption_encoder.parameters() if param.requires_grad]) 
+def calculate_total_train_params(model):
+    all_params = list([param for param in model.parameters() if param.requires_grad]) 
     return all_params
 
 
