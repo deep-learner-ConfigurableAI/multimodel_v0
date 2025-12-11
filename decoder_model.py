@@ -443,10 +443,10 @@ class ResnetGPT2Wrapper(nn.Module):
         cross_out = cross_out + self.decoder_cross_attn_ffn(self.decoder_cross_attn_norm2(cross_out))
         cross_out = self.dropout(cross_out)
 
-        # ----- 6️⃣  Prediction head -----
+        # ----- 6️  Prediction head -----
         logits = self.gpt_decoder.lm_head(cross_out)
         
-        # ----- 7️⃣  Loss -----
+        # ----- 7️  Loss -----
         loss = None
         if mode == "train":
             loss_fct = nn.CrossEntropyLoss(ignore_index=self.pad_token_id)
